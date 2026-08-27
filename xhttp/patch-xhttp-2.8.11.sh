@@ -2,8 +2,8 @@
 set -Eeuo pipefail
 
 PATCH_ID="xhttp-sessionid-extra-2811-v1"
-SOURCE_REPO="canwer0/x-ui-v2.8.11"
-SOURCE_COMMIT="9b434c1f3fc23fb727ba541d002008c6e06c9a5d"
+UPSTREAM_COMMIT="52fdf5d4296b4534e25d6221d82ec7d819a9b952"
+SOURCE_URL="https://codeload.github.com/MHSanaei/3x-ui/tar.gz/${UPSTREAM_COMMIT}"
 EXPECTED_VERSION="2.8.11"
 GO_VERSION="1.26.0"
 
@@ -258,11 +258,11 @@ if ! "$already_patched"; then
     prepare_go
 
     source_archive="$TEMP_DIR/source.tar.gz"
-    log "downloading pinned 3X-UI $EXPECTED_VERSION source ($SOURCE_COMMIT)"
+    log "downloading pinned MHSanaei/3x-ui $EXPECTED_VERSION source ($UPSTREAM_COMMIT)"
     curl -fL --retry 3 --connect-timeout 20 -o "$source_archive" \
-        "https://codeload.github.com/${SOURCE_REPO}/tar.gz/${SOURCE_COMMIT}"
+        "$SOURCE_URL"
     tar -C "$TEMP_DIR" -xzf "$source_archive"
-    source_dir="$(find "$TEMP_DIR" -mindepth 1 -maxdepth 1 -type d -name 'x-ui-v2.8.11-*' -print -quit)"
+    source_dir="$(find "$TEMP_DIR" -mindepth 1 -maxdepth 1 -type d -name '3x-ui-*' -print -quit)"
     [[ -n "$source_dir" && -f "$source_dir/go.mod" ]] || die "downloaded source layout is invalid"
     [[ "$(tr -d '[:space:]' < "$source_dir/config/version")" == "$EXPECTED_VERSION" ]] || die "downloaded source version mismatch"
 
@@ -334,7 +334,7 @@ fi
 new_sha="$(sha256sum "$PANEL_BIN" | awk '{print $1}')"
 {
     printf 'patch_id=%s\n' "$PATCH_ID"
-    printf 'source_commit=%s\n' "$SOURCE_COMMIT"
+    printf 'source_commit=%s\n' "$UPSTREAM_COMMIT"
     printf 'binary_sha256=%s\n' "$new_sha"
     printf 'backup_dir=%s\n' "$BACKUP_DIR"
     printf 'installed_utc=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"

@@ -14,6 +14,18 @@ bash <(curl -fsSL https://raw.githubusercontent.com/canwer0/guides_x-ui/main/war
 
 ---
 
+---
+
+## 🚨 Zabbix-agent
+
+Устанавливает zabbix-agent для мониторинга.
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/canwer0/guides_x-ui/main/zabbix/install-agent.sh)
+```
+
+---
+
 ## 📊 Мониторинг outbound'ов в Zabbix
 
 Устанавливает мониторинг outbound'ов 3X-UI для Zabbix.

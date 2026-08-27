@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-PATCH_ID="xhttp-sessionid-extra-2811-v1"
+PATCH_ID="xhttp-sessionid-extra-2811-v2"
 UPSTREAM_COMMIT="52fdf5d4296b4534e25d6221d82ec7d819a9b952"
 SOURCE_URL="https://codeload.github.com/MHSanaei/3x-ui/tar.gz/${UPSTREAM_COMMIT}"
 EXPECTED_VERSION="2.8.11"
@@ -30,9 +30,9 @@ die() { printf '[xhttp-2811] ERROR: %s\n' "$*" >&2; exit 1; }
 usage() {
     cat <<'USAGE'
 Usage:
-  bash patch-xhttp-2811.sh [--apply-base62-profile] [--yes]
-  bash patch-xhttp-2811.sh --rollback BACKUP_DIR
-  bash patch-xhttp-2811.sh --print-diff
+  bash patch-xhttp-2.8.11.sh [--apply-base62-profile] [--yes]
+  bash patch-xhttp-2.8.11.sh --rollback BACKUP_DIR
+  bash patch-xhttp-2.8.11.sh --print-diff
 
 Options:
   --apply-base62-profile  Apply the requested Base62 profile to every existing
@@ -269,7 +269,10 @@ if ! "$already_patched"; then
     emit_patch > "$TEMP_DIR/xhttp-2811.patch"
     (cd "$source_dir" && patch --batch --forward -p1 < "$TEMP_DIR/xhttp-2811.patch")
     grep -q 'sessionIDTable' "$source_dir/web/assets/js/model/inbound.js" || die "GUI model patch verification failed"
+    grep -q 'sessionIDPlacement: this.sessionIDPlacement' "$source_dir/web/assets/js/model/inbound.js" || die "XHTTP serialization patch verification failed"
+    grep -q 'json.sessionIDPlacement ?? json.sessionPlacement' "$source_dir/web/assets/js/model/inbound.js" || die "XHTTP legacy migration patch verification failed"
     grep -q 'Session ID Length' "$source_dir/web/html/form/stream/stream_xhttp.html" || die "GUI form patch verification failed"
+    grep -q 'xhttp-sessionid-v2' "$source_dir/web/html/inbounds.html" || die "GUI cache-buster patch verification failed"
     grep -q 'buildXHTTPLinkParams' "$source_dir/sub/subService.go" || die "subscription patch verification failed"
 
     log "compiling the patched panel (Xray binary is not rebuilt or replaced)"
@@ -711,5 +714,18 @@ index 447612c9..80a0d646 100644
 -{{end}}
 \ No newline at end of file
 +{{end}}
+diff --git a/web/html/inbounds.html b/web/html/inbounds.html
+index 8f5c1891..90401e72 100644
+--- a/web/html/inbounds.html
++++ b/web/html/inbounds.html
+@@ -595,7 +595,7 @@
+ <script src="{{ .base_path }}assets/qrcode/qrious2.min.js?{{ .cur_ver }}"></script>
+ <script src="{{ .base_path }}assets/uri/URI.min.js?{{ .cur_ver }}"></script>
+ <script src="{{ .base_path }}assets/js/model/reality_targets.js?{{ .cur_ver }}"></script>
+-<script src="{{ .base_path }}assets/js/model/inbound.js?{{ .cur_ver }}"></script>
++<script src="{{ .base_path }}assets/js/model/inbound.js?{{ .cur_ver }}-xhttp-sessionid-v2"></script>
+ <script src="{{ .base_path }}assets/js/model/dbinbound.js?{{ .cur_ver }}"></script>
+ {{template "component/aSidebar" .}}
+ {{template "component/aThemeSwitch" .}}
 __XHTTP_PATCH_END__
 __XHTTP_PATCH_EOF__

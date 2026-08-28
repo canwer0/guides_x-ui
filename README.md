@@ -36,6 +36,16 @@ bash <(curl -fsSL https://raw.githubusercontent.com/canwer0/guides_x-ui/main/zab
 
 ---
 
+## 🔄 Автоматический перезапуск Xray Core
+
+Устанавливает автоматический перезапуск Xray Core каждые 70 минут без перезапуска панели 3X-UI.
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/canwer0/guides_x-ui/main/cron-scripts/x-ray-restart.sh | sudo bash
+```
+
+---
+
 ## 🚀 XHTTP patch для 3X-UI 2.8.11
 
 Устанавливает XHTTP patch для **3X-UI 2.8.11**.

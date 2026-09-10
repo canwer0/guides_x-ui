@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-PATCH_ID="xhttp-sessionid-extra-2811-v2"
+PATCH_ID="xhttp-sessionid-extra-external-tls-2811-v3"
 UPSTREAM_COMMIT="52fdf5d4296b4534e25d6221d82ec7d819a9b952"
 SOURCE_URL="https://codeload.github.com/MHSanaei/3x-ui/tar.gz/${UPSTREAM_COMMIT}"
 EXPECTED_VERSION="2.8.11"
@@ -65,6 +65,7 @@ done
 
 emit_patch() {
     sed -n '/^__XHTTP_PATCH_BEGIN__$/,/^__XHTTP_PATCH_END__$/p' "$0" | sed '1d;$d'
+    sed -n '/^__EXTERNAL_TLS_PATCH_BEGIN__$/,/^__EXTERNAL_TLS_PATCH_END__$/p' "$0" | sed '1d;$d'
 }
 
 if "$PRINT_DIFF"; then
@@ -272,8 +273,11 @@ if ! "$already_patched"; then
     grep -q 'sessionIDPlacement: this.sessionIDPlacement' "$source_dir/web/assets/js/model/inbound.js" || die "XHTTP serialization patch verification failed"
     grep -q 'json.sessionIDPlacement ?? json.sessionPlacement' "$source_dir/web/assets/js/model/inbound.js" || die "XHTTP legacy migration patch verification failed"
     grep -q 'Session ID Length' "$source_dir/web/html/form/stream/stream_xhttp.html" || die "GUI form patch verification failed"
-    grep -q 'xhttp-sessionid-v2' "$source_dir/web/html/inbounds.html" || die "GUI cache-buster patch verification failed"
+    grep -q 'xhttp-external-tls-v3' "$source_dir/web/html/inbounds.html" || die "GUI cache-buster patch verification failed"
     grep -q 'buildXHTTPLinkParams' "$source_dir/sub/subService.go" || die "subscription patch verification failed"
+    grep -q "External Proxy terminates TLS" "$source_dir/web/assets/js/model/inbound.js" || die "GUI External Proxy TLS patch verification failed"
+    grep -q 'effectiveSecurity == "tls".*streamNetwork == "xhttp"' "$source_dir/sub/subService.go" || die "raw subscription External Proxy TLS patch verification failed"
+    grep -q 'tlsSettings\["serverName"\] = inbound.Listen' "$source_dir/sub/subJsonService.go" || die "JSON subscription External Proxy TLS patch verification failed"
 
     log "compiling the patched panel (Xray binary is not rebuilt or replaced)"
     (cd "$source_dir" && CGO_ENABLED=1 go test ./sub)
@@ -723,9 +727,92 @@ index 8f5c1891..90401e72 100644
  <script src="{{ .base_path }}assets/uri/URI.min.js?{{ .cur_ver }}"></script>
  <script src="{{ .base_path }}assets/js/model/reality_targets.js?{{ .cur_ver }}"></script>
 -<script src="{{ .base_path }}assets/js/model/inbound.js?{{ .cur_ver }}"></script>
-+<script src="{{ .base_path }}assets/js/model/inbound.js?{{ .cur_ver }}-xhttp-sessionid-v2"></script>
++<script src="{{ .base_path }}assets/js/model/inbound.js?{{ .cur_ver }}-xhttp-external-tls-v3"></script>
  <script src="{{ .base_path }}assets/js/model/dbinbound.js?{{ .cur_ver }}"></script>
  {{template "component/aSidebar" .}}
  {{template "component/aThemeSwitch" .}}
 __XHTTP_PATCH_END__
+__EXTERNAL_TLS_PATCH_BEGIN__
+diff --git a/sub/subService.go b/sub/subService.go
+index 5fe551b..1a9c055 100644
+--- a/sub/subService.go
++++ b/sub/subService.go
+@@ -571,16 +571,27 @@ func (s *SubService) genVlessLink(inbound *model.Inbound, email string) string {
+ 			port := int(ep["port"].(float64))
+ 			link := fmt.Sprintf("vless://%s@%s:%d", uuid, dest, port)
+ 
++			// Keep every External Proxy independent: params is shared by all
++			// generated links and must never be modified in place.
++			linkParams := make(map[string]string, len(params)+3)
++			for k, v := range params {
++				linkParams[k] = v
++			}
++			effectiveSecurity := security
+ 			if newSecurity != "same" {
+-				params["security"] = newSecurity
+-			} else {
+-				params["security"] = security
++				effectiveSecurity = newSecurity
++			}
++			linkParams["security"] = effectiveSecurity
++			if effectiveSecurity == "tls" && security != "tls" && streamNetwork == "xhttp" {
++				linkParams["sni"] = dest
++				linkParams["fp"] = "chrome"
++				linkParams["alpn"] = "h2"
+ 			}
+ 			url, _ := url.Parse(link)
+ 			q := url.Query()
+ 
+-			for k, v := range params {
+-				if !(newSecurity == "none" && (k == "alpn" || k == "sni" || k == "fp")) {
++			for k, v := range linkParams {
++				if !(effectiveSecurity == "none" && (k == "alpn" || k == "sni" || k == "fp")) {
+ 					q.Add(k, v)
+ 				}
+ 			}
+diff --git a/sub/subJsonService.go b/sub/subJsonService.go
+index 72c5c6f..53eb1c3 100644
+--- a/sub/subJsonService.go
++++ b/sub/subJsonService.go
+@@ -170,12 +170,21 @@ func (s *SubJsonService) getConfig(inbound *model.Inbound, client model.Client,
+ 		extPrxy := ep.(map[string]any)
+ 		inbound.Listen = extPrxy["dest"].(string)
+ 		inbound.Port = int(extPrxy["port"].(float64))
+-		newStream := stream
++		// Each External Proxy needs an independent client-side stream map.
++		streamBytes, _ := json.Marshal(stream)
++		newStream := make(map[string]any)
++		_ = json.Unmarshal(streamBytes, &newStream)
+ 		switch extPrxy["forceTls"].(string) {
+ 		case "tls":
+ 			if newStream["security"] != "tls" {
+ 				newStream["security"] = "tls"
+-				newStream["tlsSettings"] = map[string]any{}
++				tlsSettings := map[string]any{}
++				if network, _ := newStream["network"].(string); network == "xhttp" {
++					tlsSettings["serverName"] = inbound.Listen
++					tlsSettings["alpn"] = []string{"h2"}
++					tlsSettings["fingerprint"] = "chrome"
++				}
++				newStream["tlsSettings"] = tlsSettings
+ 			}
+ 		case "none":
+ 			if newStream["security"] != "none" {
+diff --git a/web/assets/js/model/inbound.js b/web/assets/js/model/inbound.js
+index d3111ee..0c57f9d 100644
+--- a/web/assets/js/model/inbound.js
++++ b/web/assets/js/model/inbound.js
+@@ -1544,6 +1544,11 @@ class Inbound extends XrayCommonClass {
+                 if (type == "tcp" && !ObjectUtil.isEmpty(flow)) {
+                     params.set("flow", flow);
+                 }
++            } else if (forceTls === 'tls' && type === 'xhttp') {
++                // External Proxy terminates TLS in front of the plain XHTTP inbound.
++                params.set("sni", address);
++                params.set("fp", UTLS_FINGERPRINT.UTLS_CHROME);
++                params.set("alpn", ALPN_OPTION.H2);
+             }
+         }
+ 
+__EXTERNAL_TLS_PATCH_END__
 __XHTTP_PATCH_EOF__

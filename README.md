@@ -48,7 +48,7 @@ curl -fsSL https://raw.githubusercontent.com/canwer0/guides_x-ui/main/cron-scrip
 
 ## 🚀 XHTTP patch для 3X-UI 2.8.11
 
-Устанавливает XHTTP patch для **3X-UI 2.8.11**.
+Шаг1. Устанавливает XHTTP patch для **3X-UI 2.8.11**.
 
 ```bash
 curl -fsSL \
@@ -58,7 +58,16 @@ curl -fsSL \
 bash -n /tmp/patch-xhttp-2.8.11.sh
 sudo bash /tmp/patch-xhttp-2.8.11.sh
 ```
+Шаг2. Разворачивает фейк сайт и настраивает nginx
 
+```bash
+curl -fsSL \
+"https://raw.githubusercontent.com/canwer0/guides_x-ui/main/xhttp/next_installation_step.sh?v=$(date +%s)" \
+-o /tmp/next_installation_step.sh
+
+bash -n /tmp/next_installation_step.sh &&
+sudo bash /tmp/next_installation_step.sh
+```
 ---
 
 > Скрипты предназначены для быстрого развёртывания и настройки компонентов 3X-UI.

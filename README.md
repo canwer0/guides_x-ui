@@ -52,10 +52,10 @@ curl -fsSL https://raw.githubusercontent.com/canwer0/guides_x-ui/main/cron-scrip
 
 ```bash
 curl -fsSL \
-  'https://raw.githubusercontent.com/canwer0/guides_x-ui/main/xhttp/patch-xhttp-2.8.11.sh?v=3' \
+  "https://raw.githubusercontent.com/canwer0/guides_x-ui/main/xhttp/patch-xhttp-2.8.11.sh?v=$(date +%s)" \
   -o /tmp/patch-xhttp-2.8.11.sh
 
-bash -n /tmp/patch-xhttp-2.8.11.sh
+bash -n /tmp/patch-xhttp-2.8.11.sh &&
 sudo bash /tmp/patch-xhttp-2.8.11.sh
 ```
 Шаг2. Разворачивает фейк сайт и настраивает nginx

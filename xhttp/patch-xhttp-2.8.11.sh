@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-PATCH_ID="xhttp-sessionid-extra-external-tls-2811-v3"
+PATCH_ID="xhttp-vlessenc-vision-2811-v4"
 UPSTREAM_COMMIT="52fdf5d4296b4534e25d6221d82ec7d819a9b952"
 SOURCE_URL="https://codeload.github.com/MHSanaei/3x-ui/tar.gz/${UPSTREAM_COMMIT}"
 EXPECTED_VERSION="2.8.11"
@@ -66,6 +66,7 @@ done
 emit_patch() {
     sed -n '/^__XHTTP_PATCH_BEGIN__$/,/^__XHTTP_PATCH_END__$/p' "$0" | sed '1d;$d'
     sed -n '/^__EXTERNAL_TLS_PATCH_BEGIN__$/,/^__EXTERNAL_TLS_PATCH_END__$/p' "$0" | sed '1d;$d'
+    sed -n '/^__VLESSENC_VISION_PATCH_BEGIN__$/,/^__VLESSENC_VISION_PATCH_END__$/p' "$0" | sed '1d;$d'
 }
 
 if "$PRINT_DIFF"; then
@@ -175,11 +176,16 @@ if "$APPLY_PROFILE"; then
     fi
 fi
 
-warn_old_xray() {
+inspect_installed_xray() {
     local xray_bin version_line
     xray_bin="$(find "$XUI_DIR/bin" -maxdepth 1 -type f -name 'xray-linux-*' -print -quit 2>/dev/null || true)"
-    [[ -n "$xray_bin" ]] || return 0
-    version_line="$($xray_bin version 2>/dev/null | head -n1 || true)"
+    if [[ -z "$xray_bin" || ! -x "$xray_bin" ]]; then
+        warn "the installed Xray binary could not be located under $XUI_DIR/bin"
+        warn "the script will not install or update Xray Core automatically"
+        return 0
+    fi
+    version_line="$("$xray_bin" version 2>/dev/null | head -n1 || true)"
+    log "using installed ${version_line:-Xray binary: $xray_bin}"
     if [[ "$version_line" =~ Xray[[:space:]]+([0-9]+)\.([0-9]+)\.([0-9]+) ]]; then
         local major=${BASH_REMATCH[1]} minor=${BASH_REMATCH[2]} patch=${BASH_REMATCH[3]}
         if (( major < 26 || (major == 26 && minor < 6) || (major == 26 && minor == 6 && patch < 22) )); then
@@ -187,8 +193,16 @@ warn_old_xray() {
             warn "the script will not update Xray Core automatically"
         fi
     fi
+
+    if ! "$xray_bin" vlessenc >/dev/null 2>&1; then
+        warn "${version_line:-$xray_bin} does not provide a working 'xray vlessenc' command"
+        warn "VLESS Encryption key generation and runtime support require a compatible installed Xray Core"
+        warn "the script will not update Xray Core automatically; manual key entry remains available in the panel"
+    else
+        log "installed Xray Core supports the vlessenc generator"
+    fi
 }
-warn_old_xray
+inspect_installed_xray
 
 if "$already_patched" && ! "$APPLY_PROFILE"; then
     log "nothing to do"
@@ -273,11 +287,16 @@ if ! "$already_patched"; then
     grep -q 'sessionIDPlacement: this.sessionIDPlacement' "$source_dir/web/assets/js/model/inbound.js" || die "XHTTP serialization patch verification failed"
     grep -q 'json.sessionIDPlacement ?? json.sessionPlacement' "$source_dir/web/assets/js/model/inbound.js" || die "XHTTP legacy migration patch verification failed"
     grep -q 'Session ID Length' "$source_dir/web/html/form/stream/stream_xhttp.html" || die "GUI form patch verification failed"
-    grep -q 'xhttp-external-tls-v3' "$source_dir/web/html/inbounds.html" || die "GUI cache-buster patch verification failed"
+    grep -q 'xhttp-vlessenc-vision-v4' "$source_dir/web/html/inbounds.html" || die "GUI cache-buster patch verification failed"
     grep -q 'buildXHTTPLinkParams' "$source_dir/sub/subService.go" || die "subscription patch verification failed"
     grep -q "External Proxy terminates TLS" "$source_dir/web/assets/js/model/inbound.js" || die "GUI External Proxy TLS patch verification failed"
     grep -q 'effectiveSecurity == "tls".*streamNetwork == "xhttp"' "$source_dir/sub/subService.go" || die "raw subscription External Proxy TLS patch verification failed"
     grep -q 'tlsSettings\["serverName"\] = inbound.Listen' "$source_dir/sub/subJsonService.go" || die "JSON subscription External Proxy TLS patch verification failed"
+    grep -q 'hasVlessEncryption()' "$source_dir/web/assets/js/model/inbound.js" || die "GUI VLESS Encryption capability patch verification failed"
+    grep -q "this.network === 'xhttp'.*this.hasVlessEncryption()" "$source_dir/web/assets/js/model/inbound.js" || die "GUI XHTTP Vision gate verification failed"
+    grep -q 'vlessFlowAllowed(streamNetwork, security, settings)' "$source_dir/sub/subService.go" || die "raw subscription XHTTP Vision patch verification failed"
+    grep -q 'clearVlessFlowIfUnsupported' "$source_dir/web/html/modals/inbound_modal.html" || die "disabled VLESS Encryption flow cleanup verification failed"
+    [[ -f "$source_dir/sub/vless_flow_test.go" ]] || die "VLESS Encryption regression tests are missing"
 
     log "compiling the patched panel (Xray binary is not rebuilt or replaced)"
     (cd "$source_dir" && CGO_ENABLED=1 go test ./sub)
@@ -349,6 +368,15 @@ new_sha="$(sha256sum "$PANEL_BIN" | awk '{print $1}')"
 chmod 0644 "$MARKER_PATH"
 
 start_and_verify_service
+
+xray_bin="$(find "$XUI_DIR/bin" -maxdepth 1 -type f -name 'xray-linux-*' -print -quit 2>/dev/null || true)"
+xray_config="$XUI_DIR/bin/config.json"
+if [[ -x "$xray_bin" && -s "$xray_config" ]]; then
+    log "validating the generated Xray config with the installed core"
+    "$xray_bin" run -test -config "$xray_config"
+else
+    warn "generated Xray config check skipped: binary or $xray_config is unavailable"
+fi
 STATE_CHANGED=false
 trap - ERR
 
@@ -815,4 +843,439 @@ index d3111ee..0c57f9d 100644
          }
  
 __EXTERNAL_TLS_PATCH_END__
+__VLESSENC_VISION_PATCH_BEGIN__
+diff --git a/web/assets/js/model/inbound.js b/web/assets/js/model/inbound.js
+index a411706..cf6e83e 100644
+--- a/web/assets/js/model/inbound.js
++++ b/web/assets/js/model/inbound.js
+@@ -1375,18 +1375,24 @@ class Inbound extends XrayCommonClass {
+         return exp > 0 ? exp < new Date().getTime() : false;
+     }
+ 
+-    canEnableTls() {
+-        if (![Protocols.VMESS, Protocols.VLESS, Protocols.TROJAN, Protocols.SHADOWSOCKS].includes(this.protocol)) return false;
+-        return ["tcp", "ws", "http", "grpc", "httpupgrade", "xhttp"].includes(this.network);
+-    }
+-
+-    //this is used for xtls-rprx-vision
+-    canEnableTlsFlow() {
+-        if (((this.stream.security === 'tls') || (this.stream.security === 'reality')) && (this.network === "tcp")) {
+-            return this.protocol === Protocols.VLESS;
+-        }
+-        return false;
+-    }
++    canEnableTls() {
++        if (![Protocols.VMESS, Protocols.VLESS, Protocols.TROJAN, Protocols.SHADOWSOCKS].includes(this.protocol)) return false;
++        return ["tcp", "ws", "http", "grpc", "httpupgrade", "xhttp"].includes(this.network);
++    }
++
++    hasVlessEncryption() {
++        if (this.protocol !== Protocols.VLESS) return false;
++        const isSet = (value) => value !== undefined && value !== null && value !== '' && value !== 'none';
++        return isSet(this.settings?.encryption) || isSet(this.settings?.decryption);
++    }
++
++    //this is used for xtls-rprx-vision
++    canEnableTlsFlow() {
++        if (this.protocol !== Protocols.VLESS) return false;
++        if (this.network === 'tcp' && (this.stream.security === 'tls' || this.stream.security === 'reality')) return true;
++        if (this.network === 'xhttp' && this.hasVlessEncryption()) return true;
++        return false;
++    }
+ 
+     // Vision seed applies only when vision flow is selected
+     canEnableVisionSeed() {
+@@ -1573,11 +1579,17 @@ class Inbound extends XrayCommonClass {
+             }
+         }
+ 
+-        else {
+-            params.set("security", "none");
+-        }
+-
+-        const link = `vless://${uuid}@${address}:${port}`;
++        else {
++            params.set("security", "none");
++        }
++
++        // XHTTP carries Vision through VLESS Encryption itself, independently
++        // of the transport security (none/TLS/REALITY) and XHTTP mode.
++        if (type === 'xhttp' && this.hasVlessEncryption() && !ObjectUtil.isEmpty(flow)) {
++            params.set("flow", flow);
++        }
++
++        const link = `vless://${uuid}@${address}:${port}`;
+         const url = new URL(link);
+         for (const [key, value] of params) {
+             url.searchParams.set(key, value)
+diff --git a/web/html/modals/inbound_modal.html b/web/html/modals/inbound_modal.html
+index fb44ac0..ce1247b 100644
+--- a/web/html/modals/inbound_modal.html
++++ b/web/html/modals/inbound_modal.html
+@@ -15,10 +15,15 @@
+         isEdit: false,
+         confirm: null,
+         inbound: new Inbound(),
+-        dbInbound: new DBInbound(),
+-        ok() {
+-            ObjectUtil.execute(inModal.confirm, inModal.inbound, inModal.dbInbound);
+-        },
++        dbInbound: new DBInbound(),
++        ok() {
++            if (inModal.inbound.protocol === Protocols.VLESS && !inModal.inbound.canEnableTlsFlow()) {
++                inModal.inbound.settings.vlesses.forEach(client => {
++                    client.flow = "";
++                });
++            }
++            ObjectUtil.execute(inModal.confirm, inModal.inbound, inModal.dbInbound);
++        },
+         show({ title = '', okText = '{{ i18n "sure" }}', inbound = null, dbInbound = null, confirm = (inbound, dbInbound) => { }, isEdit = false }) {
+             this.title = title;
+             this.okText = okText;
+@@ -130,7 +135,7 @@
+                 }
+             }
+         },
+-        watch: {
++        watch: {
+             'inModal.inbound.stream.security'(newVal, oldVal) {
+                 // Clear flow when security changes from reality/tls to none
+                 if (inModal.inbound.protocol == Protocols.VLESS && !inModal.inbound.canEnableTlsFlow()) {
+@@ -140,7 +145,7 @@
+                 }
+             },
+             // Ensure testseed is always initialized when vision flow is enabled
+-            'inModal.inbound.settings.vlesses': {
++            'inModal.inbound.settings.vlesses': {
+                 handler() {
+                     if (inModal.inbound.protocol === Protocols.VLESS && inModal.inbound.settings && inModal.inbound.settings.vlesses) {
+                         const hasVisionFlow = inModal.inbound.settings.vlesses.some(c => c.flow === 'xtls-rprx-vision' || c.flow === 'xtls-rprx-vision-udp443');
+@@ -149,11 +154,24 @@
+                         }
+                     }
+                 },
+-                deep: true
+-            }
+-        },
+-        methods: {
+-            streamNetworkChange() {
++                deep: true
++            },
++            'inModal.inbound.settings.encryption'() {
++                this.clearVlessFlowIfUnsupported();
++            },
++            'inModal.inbound.settings.decryption'() {
++                this.clearVlessFlowIfUnsupported();
++            }
++        },
++        methods: {
++            clearVlessFlowIfUnsupported() {
++                if (inModal.inbound.protocol === Protocols.VLESS && !inModal.inbound.canEnableTlsFlow()) {
++                    inModal.inbound.settings.vlesses.forEach(client => {
++                        client.flow = "";
++                    });
++                }
++            },
++            streamNetworkChange() {
+                 if (!inModal.inbound.canEnableTls()) {
+                     this.inModal.inbound.stream.security = 'none';
+                 }
+@@ -296,4 +314,4 @@
+     });
+ 
+ </script>
+-{{end}}
+\ No newline at end of file
++{{end}}
+diff --git a/sub/subService.go b/sub/subService.go
+index 047f43b..1801e0e 100644
+--- a/sub/subService.go
++++ b/sub/subService.go
+@@ -411,6 +411,31 @@ func buildXHTTPLinkParams(xhttp map[string]any) map[string]string {
+ 	return params
+ }
+ 
++// vlessEncryptionEnabled reports whether the inbound has a real generated
++// VLESS Encryption profile. "vlessenc" is the Xray subcommand name, not a
++// stored value; empty and "none" are the disabled sentinels.
++func vlessEncryptionEnabled(settings map[string]any) bool {
++	for _, key := range []string{"encryption", "decryption"} {
++		if value, ok := settings[key].(string); ok && value != "" && value != "none" {
++			return true
++		}
++	}
++	return false
++}
++
++// vlessFlowAllowed mirrors the panel UI: classic Vision uses TCP with TLS or
++// REALITY, while every XHTTP mode may use Vision when VLESS Encryption is on.
++func vlessFlowAllowed(network, security string, settings map[string]any) bool {
++	switch network {
++	case "tcp":
++		return security == "tls" || security == "reality"
++	case "xhttp":
++		return vlessEncryptionEnabled(settings)
++	default:
++		return false
++	}
++}
++
+ func (s *SubService) genVlessLink(inbound *model.Inbound, email string) string {
+ 	var address string
+ 	if inbound.Listen == "" || inbound.Listen == "0.0.0.0" || inbound.Listen == "::" || inbound.Listen == "::0" {
+@@ -556,11 +581,14 @@ func (s *SubService) genVlessLink(inbound *model.Inbound, email string) string {
+ 		}
+ 	}
+ 
+-	if security != "tls" && security != "reality" {
+-		params["security"] = "none"
+-	}
+-
+-	externalProxies, _ := stream["externalProxy"].([]any)
++	if security != "tls" && security != "reality" {
++		params["security"] = "none"
++	}
++	if len(clients[clientIndex].Flow) > 0 && vlessFlowAllowed(streamNetwork, security, settings) {
++		params["flow"] = clients[clientIndex].Flow
++	}
++
++	externalProxies, _ := stream["externalProxy"].([]any)
+ 
+ 	if len(externalProxies) > 0 {
+ 		links := make([]string, 0, len(externalProxies))
+diff --git a/web/html/inbounds.html b/web/html/inbounds.html
+index 4794752..f3f1879 100644
+--- a/web/html/inbounds.html
++++ b/web/html/inbounds.html
+@@ -595,7 +595,7 @@
+ <script src="{{ .base_path }}assets/qrcode/qrious2.min.js?{{ .cur_ver }}"></script>
+ <script src="{{ .base_path }}assets/uri/URI.min.js?{{ .cur_ver }}"></script>
+ <script src="{{ .base_path }}assets/js/model/reality_targets.js?{{ .cur_ver }}"></script>
+-<script src="{{ .base_path }}assets/js/model/inbound.js?{{ .cur_ver }}-xhttp-external-tls-v3"></script>
++<script src="{{ .base_path }}assets/js/model/inbound.js?{{ .cur_ver }}-xhttp-vlessenc-vision-v4"></script>
+ <script src="{{ .base_path }}assets/js/model/dbinbound.js?{{ .cur_ver }}"></script>
+ {{template "component/aSidebar" .}}
+ {{template "component/aThemeSwitch" .}}
+diff --git a/sub/vless_flow_test.go b/sub/vless_flow_test.go
+new file mode 100644
+index 0000000..a7801ed
+--- /dev/null
++++ b/sub/vless_flow_test.go
+@@ -0,0 +1,215 @@
++package sub
++
++import (
++	"encoding/json"
++	"net/url"
++	"testing"
++
++	"github.com/mhsanaei/3x-ui/v2/database/model"
++)
++
++func TestVlessEncryptionEnabled(t *testing.T) {
++	tests := []struct {
++		name     string
++		settings map[string]any
++		want     bool
++	}{
++		{name: "missing", settings: map[string]any{}, want: false},
++		{name: "none", settings: map[string]any{"encryption": "none", "decryption": "none"}, want: false},
++		{name: "empty", settings: map[string]any{"encryption": "", "decryption": ""}, want: false},
++		{name: "client profile", settings: map[string]any{"encryption": "mlkem768x25519plus.native.0rtt.client"}, want: true},
++		{name: "server profile", settings: map[string]any{"decryption": "mlkem768x25519plus.native.0rtt.server"}, want: true},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			if got := vlessEncryptionEnabled(tt.settings); got != tt.want {
++				t.Fatalf("vlessEncryptionEnabled() = %v, want %v", got, tt.want)
++			}
++		})
++	}
++}
++
++func TestVlessFlowAllowed(t *testing.T) {
++	enabled := map[string]any{
++		"encryption": "mlkem768x25519plus.native.0rtt.client",
++		"decryption": "mlkem768x25519plus.native.0rtt.server",
++	}
++	disabled := map[string]any{"encryption": "none", "decryption": "none"}
++	tests := []struct {
++		name, network, security string
++		settings                map[string]any
++		want                    bool
++	}{
++		{name: "classic tcp tls", network: "tcp", security: "tls", settings: disabled, want: true},
++		{name: "classic tcp reality", network: "tcp", security: "reality", settings: disabled, want: true},
++		{name: "plain tcp remains disabled", network: "tcp", security: "none", settings: enabled, want: false},
++		{name: "xhttp none with vlessenc", network: "xhttp", security: "none", settings: enabled, want: true},
++		{name: "xhttp tls with vlessenc", network: "xhttp", security: "tls", settings: enabled, want: true},
++		{name: "xhttp reality with vlessenc", network: "xhttp", security: "reality", settings: enabled, want: true},
++		{name: "xhttp without vlessenc", network: "xhttp", security: "none", settings: disabled, want: false},
++		{name: "other transport", network: "ws", security: "tls", settings: enabled, want: false},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			if got := vlessFlowAllowed(tt.network, tt.security, tt.settings); got != tt.want {
++				t.Fatalf("vlessFlowAllowed(%q, %q) = %v, want %v", tt.network, tt.security, got, tt.want)
++			}
++		})
++	}
++}
++
++func TestGenVlessLinkXHTTPVlessEncVision(t *testing.T) {
++	for _, security := range []string{"none", "tls", "reality"} {
++		t.Run(security, func(t *testing.T) {
++			inbound := newXHTTPVisionInbound(t, security, true)
++			link := NewSubService(false, "-ie").genVlessLink(inbound, "vision@example.com")
++			query := parseVlessLinkQuery(t, link)
++
++			if got := query.Get("flow"); got != "xtls-rprx-vision" {
++				t.Fatalf("flow = %q, want xtls-rprx-vision; link: %s", got, link)
++			}
++			values, ok := query["encryption"]
++			if !ok || len(values) != 1 || values[0] != "mlkem768x25519plus.native.0rtt.client" {
++				t.Fatalf("encryption parameter = %#v, want generated VLESSENC client profile; link: %s", values, link)
++			}
++		})
++	}
++}
++
++func TestGenVlessLinkXHTTPVisionWithoutVlessEnc(t *testing.T) {
++	inbound := newXHTTPVisionInbound(t, "none", false)
++	link := NewSubService(false, "-ie").genVlessLink(inbound, "vision@example.com")
++	query := parseVlessLinkQuery(t, link)
++
++	if got := query.Get("flow"); got != "" {
++		t.Fatalf("flow = %q, want no flow without VLESSENC; link: %s", got, link)
++	}
++	if values, ok := query["encryption"]; ok {
++		t.Fatalf("unexpected encryption parameter without VLESSENC: %#v; link: %s", values, link)
++	}
++}
++
++func newXHTTPVisionInbound(t *testing.T, security string, withVlessEnc bool) *model.Inbound {
++	t.Helper()
++
++	settings := map[string]any{
++		"clients": []model.Client{{
++			ID:     "11111111-1111-4111-8111-111111111111",
++			Email:  "vision@example.com",
++			Flow:   "xtls-rprx-vision",
++			Enable: true,
++		}},
++	}
++	if withVlessEnc {
++		settings["encryption"] = "mlkem768x25519plus.native.0rtt.client"
++		settings["decryption"] = "mlkem768x25519plus.native.0rtt.server"
++	}
++
++	stream := map[string]any{
++		"network":  "xhttp",
++		"security": security,
++		"xhttpSettings": map[string]any{
++			"mode": "packet-up",
++			"path": "/vision-test",
++		},
++	}
++	switch security {
++	case "tls":
++		stream["tlsSettings"] = map[string]any{
++			"alpn":       []string{"h2"},
++			"serverName": "tls.example.com",
++			"settings":   map[string]any{"fingerprint": "chrome"},
++		}
++	case "reality":
++		stream["realitySettings"] = map[string]any{
++			"serverNames": []string{"reality.example.com"},
++			"shortIds":    []string{"0123456789abcdef"},
++			"settings": map[string]any{
++				"publicKey":   "test-public-key",
++				"fingerprint": "chrome",
++			},
++		}
++	}
++
++	settingsJSON, err := json.Marshal(settings)
++	if err != nil {
++		t.Fatalf("marshal inbound settings: %v", err)
++	}
++	streamJSON, err := json.Marshal(stream)
++	if err != nil {
++		t.Fatalf("marshal stream settings: %v", err)
++	}
++
++	return &model.Inbound{
++		Listen:         "203.0.113.10",
++		Port:           443,
++		Protocol:       model.VLESS,
++		Settings:       string(settingsJSON),
++		StreamSettings: string(streamJSON),
++		Remark:         "xhttp-vlessenc",
++	}
++}
++
++func parseVlessLinkQuery(t *testing.T, link string) url.Values {
++	t.Helper()
++	parsed, err := url.Parse(link)
++	if err != nil {
++		t.Fatalf("parse VLESS link %q: %v", link, err)
++	}
++	return parsed.Query()
++}
++
++func TestBuildXHTTPLinkParamsKeepsV3AdvancedFields(t *testing.T) {
++	xhttp := map[string]any{
++		"mode":                "packet-up",
++		"path":                "/xhttp",
++		"host":                "origin.example",
++		"sessionIDPlacement":  "header",
++		"sessionIDKey":        "X-Session-ID",
++		"sessionIDTable":      "Base62",
++		"sessionIDLength":     "24-32",
++		"uplinkChunkSize":     "2048-3072",
++		"xPaddingBytes":       "32-96",
++		"xPaddingObfsMode":    true,
++		"xPaddingPlacement":   "header",
++		"xPaddingKey":         "X-Request-ID",
++		"xPaddingMethod":      "tokenish",
++		"uplinkHTTPMethod":    "POST",
++		"uplinkDataPlacement": "header",
++		"uplinkDataKey":       "X-Payload",
++		"seqPlacement":        "header",
++		"seqKey":              "X-Sequence",
++		"scMaxEachPostBytes":  "1000000",
++		"headers":             map[string]any{"Host": "origin.example", "X-Custom": "kept"},
++	}
++
++	params := buildXHTTPLinkParams(xhttp)
++	for _, key := range []string{"path", "host", "mode", "extra"} {
++		if params[key] == "" {
++			t.Fatalf("missing %s in XHTTP share parameters: %#v", key, params)
++		}
++	}
++	for _, token := range []string{
++		`"sessionIDTable":"Base62"`,
++		`"sessionIDLength":"24-32"`,
++		`"sessionPlacement":"header"`,
++		`"sessionKey":"X-Session-ID"`,
++		`"uplinkChunkSize":"2048-3072"`,
++		`"X-Custom":"kept"`,
++	} {
++		if !contains(params["extra"], token) {
++			t.Fatalf("extra does not contain %s: %s", token, params["extra"])
++		}
++	}
++}
++
++func contains(haystack, needle string) bool {
++	for i := 0; i+len(needle) <= len(haystack); i++ {
++		if haystack[i:i+len(needle)] == needle {
++			return true
++		}
++	}
++	return false
++}
+__VLESSENC_VISION_PATCH_END__
 __XHTTP_PATCH_EOF__

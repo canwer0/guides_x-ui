@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-PATCH_ID="xhttp-vlessenc-vision-2811-v4"
+PATCH_ID="xhttp-vlessenc-vision-outbound-2811-v5"
 UPSTREAM_COMMIT="52fdf5d4296b4534e25d6221d82ec7d819a9b952"
 SOURCE_URL="https://codeload.github.com/MHSanaei/3x-ui/tar.gz/${UPSTREAM_COMMIT}"
 EXPECTED_VERSION="2.8.11"
@@ -67,6 +67,7 @@ emit_patch() {
     sed -n '/^__XHTTP_PATCH_BEGIN__$/,/^__XHTTP_PATCH_END__$/p' "$0" | sed '1d;$d'
     sed -n '/^__EXTERNAL_TLS_PATCH_BEGIN__$/,/^__EXTERNAL_TLS_PATCH_END__$/p' "$0" | sed '1d;$d'
     sed -n '/^__VLESSENC_VISION_PATCH_BEGIN__$/,/^__VLESSENC_VISION_PATCH_END__$/p' "$0" | sed '1d;$d'
+    sed -n '/^__OUTBOUND_PATCH_BEGIN__$/,/^__OUTBOUND_PATCH_END__$/p' "$0" | sed '1d;$d'
 }
 
 if "$PRINT_DIFF"; then
@@ -287,7 +288,8 @@ if ! "$already_patched"; then
     grep -q 'sessionIDPlacement: this.sessionIDPlacement' "$source_dir/web/assets/js/model/inbound.js" || die "XHTTP serialization patch verification failed"
     grep -q 'json.sessionIDPlacement ?? json.sessionPlacement' "$source_dir/web/assets/js/model/inbound.js" || die "XHTTP legacy migration patch verification failed"
     grep -q 'Session ID Length' "$source_dir/web/html/form/stream/stream_xhttp.html" || die "GUI form patch verification failed"
-    grep -q 'xhttp-vlessenc-vision-v4' "$source_dir/web/html/inbounds.html" || die "GUI cache-buster patch verification failed"
+    grep -q 'xhttp-vlessenc-vision-v5' "$source_dir/web/html/inbounds.html" || die "GUI cache-buster patch verification failed"
+    grep -q 'xhttp-vlessenc-outbound-v5' "$source_dir/web/html/xray.html" || die "outbound GUI cache-buster patch verification failed"
     grep -q 'buildXHTTPLinkParams' "$source_dir/sub/subService.go" || die "subscription patch verification failed"
     grep -q "External Proxy terminates TLS" "$source_dir/web/assets/js/model/inbound.js" || die "GUI External Proxy TLS patch verification failed"
     grep -q 'effectiveSecurity == "tls".*streamNetwork == "xhttp"' "$source_dir/sub/subService.go" || die "raw subscription External Proxy TLS patch verification failed"
@@ -297,9 +299,18 @@ if ! "$already_patched"; then
     grep -q 'vlessFlowAllowed(streamNetwork, security, settings)' "$source_dir/sub/subService.go" || die "raw subscription XHTTP Vision patch verification failed"
     grep -q 'clearVlessFlowIfUnsupported' "$source_dir/web/html/modals/inbound_modal.html" || die "disabled VLESS Encryption flow cleanup verification failed"
     [[ -f "$source_dir/sub/vless_flow_test.go" ]] || die "VLESS Encryption regression tests are missing"
+    grep -q 'additionalSettings' "$source_dir/web/assets/js/model/outbound.js" || die "outbound XHTTP field-preservation patch verification failed"
+    grep -q 'parseXHTTPExtra' "$source_dir/web/assets/js/model/outbound.js" || die "outbound XHTTP URI importer patch verification failed"
+    [[ -f "$source_dir/scripts/patch-tests/outbound-model.test.cjs" ]] || die "outbound XHTTP regression tests are missing"
+    [[ -f "$source_dir/xray/config_outbound_test.go" ]] || die "runtime outbound config regression tests are missing"
 
     log "compiling the patched panel (Xray binary is not rebuilt or replaced)"
-    (cd "$source_dir" && CGO_ENABLED=1 go test ./sub)
+    (cd "$source_dir" && CGO_ENABLED=1 go test ./sub ./xray)
+    if command -v node >/dev/null; then
+        (cd "$source_dir" && node scripts/patch-tests/outbound-model.test.cjs)
+    else
+        warn "Node.js is unavailable; outbound model regression tests are packaged but were not executed"
+    fi
     (cd "$source_dir" && CGO_ENABLED=1 go build -trimpath -ldflags '-s -w' -o "$TEMP_DIR/x-ui.patched" main.go)
     [[ "$($TEMP_DIR/x-ui.patched -v | tr -d '\r' | tail -n1)" == "$EXPECTED_VERSION" ]] || die "patched binary version check failed"
 fi
@@ -1052,7 +1063,7 @@ index 4794752..f3f1879 100644
  <script src="{{ .base_path }}assets/uri/URI.min.js?{{ .cur_ver }}"></script>
  <script src="{{ .base_path }}assets/js/model/reality_targets.js?{{ .cur_ver }}"></script>
 -<script src="{{ .base_path }}assets/js/model/inbound.js?{{ .cur_ver }}-xhttp-external-tls-v3"></script>
-+<script src="{{ .base_path }}assets/js/model/inbound.js?{{ .cur_ver }}-xhttp-vlessenc-vision-v4"></script>
++<script src="{{ .base_path }}assets/js/model/inbound.js?{{ .cur_ver }}-xhttp-vlessenc-vision-v5"></script>
  <script src="{{ .base_path }}assets/js/model/dbinbound.js?{{ .cur_ver }}"></script>
  {{template "component/aSidebar" .}}
  {{template "component/aThemeSwitch" .}}
@@ -1278,4 +1289,464 @@ index 0000000..a7801ed
 +	return false
 +}
 __VLESSENC_VISION_PATCH_END__
+__OUTBOUND_PATCH_BEGIN__
+diff --git a/web/assets/js/model/outbound.js b/web/assets/js/model/outbound.js
+index 5660623..08bf2d7 100644
+--- a/web/assets/js/model/outbound.js
++++ b/web/assets/js/model/outbound.js
+@@ -300,6 +300,7 @@ class xHTTPStreamSettings extends CommonClass {
+             hMaxReusableSecs: "1800-3000",
+             hKeepAlivePeriod: 0,
+         },
++        additionalSettings = {},
+     ) {
+         super();
+         this.path = path;
+@@ -308,38 +309,70 @@ class xHTTPStreamSettings extends CommonClass {
+         this.noGRPCHeader = noGRPCHeader;
+         this.scMinPostsIntervalMs = scMinPostsIntervalMs;
+         this.xmux = xmux;
++        this.additionalSettings = additionalSettings;
+     }
+ 
+     static fromJson(json = {}) {
++        if (!json || typeof json !== 'object' || Array.isArray(json)) json = {};
++        const knownKeys = new Set([
++            'path', 'host', 'mode', 'noGRPCHeader', 'scMinPostsIntervalMs', 'xmux',
++            'sessionPlacement', 'sessionKey',
++        ]);
++        const additionalSettings = Object.create(null);
++        Object.entries(json).forEach(([key, value]) => {
++            if (!knownKeys.has(key)) additionalSettings[key] = value;
++        });
++        if (!Object.prototype.hasOwnProperty.call(json, 'sessionIDPlacement')
++            && Object.prototype.hasOwnProperty.call(json, 'sessionPlacement')) {
++            additionalSettings.sessionIDPlacement = json.sessionPlacement;
++        }
++        if (!Object.prototype.hasOwnProperty.call(json, 'sessionIDKey')
++            && Object.prototype.hasOwnProperty.call(json, 'sessionKey')) {
++            additionalSettings.sessionIDKey = json.sessionKey;
++        }
+         return new xHTTPStreamSettings(
+             json.path,
+             json.host,
+             json.mode,
+             json.noGRPCHeader,
+             json.scMinPostsIntervalMs,
+-            json.xmux
++            json.xmux,
++            additionalSettings,
+         );
+     }
+ 
+     toJson() {
+         return {
++            ...this.additionalSettings,
+             path: this.path,
+             host: this.host,
+             mode: this.mode,
+             noGRPCHeader: this.noGRPCHeader,
+             scMinPostsIntervalMs: this.scMinPostsIntervalMs,
+-            xmux: {
+-                maxConcurrency: this.xmux.maxConcurrency,
+-                maxConnections: this.xmux.maxConnections,
+-                cMaxReuseTimes: this.xmux.cMaxReuseTimes,
+-                hMaxRequestTimes: this.xmux.hMaxRequestTimes,
+-                hMaxReusableSecs: this.xmux.hMaxReusableSecs,
+-                hKeepAlivePeriod: this.xmux.hKeepAlivePeriod,
+-            },
++            xmux: this.xmux == null ? this.xmux : { ...this.xmux },
+         };
+     }
+ }
+ 
++function parseXHTTPExtra(value) {
++    if (typeof value !== 'string' || value.length === 0) return {};
++    const parseObject = (candidate) => {
++        const parsed = JSON.parse(candidate);
++        return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null;
++    };
++    try {
++        return parseObject(value) || {};
++    } catch (_) {
++        // URLSearchParams already decodes the query once. Only retry one
++        // additional decode for older double-encoded share links.
++        try {
++            return parseObject(decodeURIComponent(value)) || {};
++        } catch (_) {
++            return {};
++        }
++    }
++}
++
+ class TlsStreamSettings extends CommonClass {
+     constructor(
+         serverName = '',
+@@ -967,7 +1000,11 @@ class Outbound extends CommonClass {
+         } else if (type === 'httpupgrade') {
+             stream.httpupgrade = new HttpUpgradeStreamSettings(path, host);
+         } else if (type === 'xhttp') {
+-            stream.xhttp = new xHTTPStreamSettings(path, host, mode);
++            const xhttpSettings = parseXHTTPExtra(url.searchParams.get('extra'));
++            if (url.searchParams.has('path')) xhttpSettings.path = path;
++            if (url.searchParams.has('host')) xhttpSettings.host = host;
++            if (url.searchParams.has('mode')) xhttpSettings.mode = mode;
++            stream.xhttp = xHTTPStreamSettings.fromJson(xhttpSettings);
+         }
+ 
+         if (security == 'tls') {
+@@ -1595,4 +1632,4 @@ Outbound.HysteriaSettings = class extends CommonClass {
+             version: this.version
+         };
+     }
+-};
+\ No newline at end of file
++};
+diff --git a/web/html/xray.html b/web/html/xray.html
+index ebe31f4..501b7e4 100644
+--- a/web/html/xray.html
++++ b/web/html/xray.html
+@@ -140,7 +140,7 @@
+ </a-layout>
+ {{template "page/body_scripts" .}}
+ <script
+-  src="{{ .base_path }}assets/js/model/outbound.js?{{ .cur_ver }}"></script>
++  src="{{ .base_path }}assets/js/model/outbound.js?{{ .cur_ver }}-xhttp-vlessenc-outbound-v5"></script>
+ <script
+   src="{{ .base_path }}assets/codemirror/codemirror.min.js?{{ .cur_ver }}"></script>
+ <script src="{{ .base_path }}assets/codemirror/javascript.js"></script>
+@@ -1562,4 +1562,4 @@
+     },
+   });
+ </script>
+-{{ template "page/body_end" .}}
+\ No newline at end of file
++{{ template "page/body_end" .}}
+diff --git a/scripts/patch-tests/outbound-model.test.cjs b/scripts/patch-tests/outbound-model.test.cjs
+new file mode 100644
+index 0000000..2761102
+--- /dev/null
++++ b/scripts/patch-tests/outbound-model.test.cjs
+@@ -0,0 +1,276 @@
++const assert = require('node:assert/strict');
++const fs = require('node:fs');
++const path = require('node:path');
++const vm = require('node:vm');
++
++const repositoryRoot = path.resolve(__dirname, '../..');
++const outboundSource = fs.readFileSync(
++    path.join(repositoryRoot, 'web/assets/js/model/outbound.js'),
++    'utf8',
++);
++const runtimeConfigMode = process.argv.includes('--runtime-config');
++const context = {
++    URL,
++    URLSearchParams,
++    data: undefined,
++    ObjectUtil: {
++        isEmpty: (value) => value === undefined || value === null || value === '',
++        isArrEmpty: (value) => !Array.isArray(value) || value.length === 0,
++    },
++    console,
++};
++vm.createContext(context);
++vm.runInContext(`${outboundSource}\nglobalThis.__outboundTests = { Outbound };`, context);
++const Outbound = context.__outboundTests.Outbound;
++const plain = (value) => JSON.parse(JSON.stringify(value));
++const acceptedURI = 'vless://8d47dbeb-e742-4e08-8534-001e9a3d9482@thebestfilms.site:443?type=xhttp&encryption=none&path=%2Fvideos%2Fmedia%2Fts%2F1080%2F&host=thebestfilms.site&mode=stream-one&extra=%7B%22mode%22%3A%22stream-one%22%2C%22xPaddingBytes%22%3A%22128-1120%22%2C%22xPaddingObfsMode%22%3Atrue%2C%22xPaddingKey%22%3A%22X-Amz-Meta-Trace%22%2C%22xPaddingHeader%22%3A%22X-Amz-Security-Token%22%2C%22xPaddingPlacement%22%3A%22header%22%2C%22xPaddingMethod%22%3A%22tokenish%22%2C%22uplinkHTTPMethod%22%3A%22POST%22%2C%22sessionIDPlacement%22%3A%22header%22%2C%22sessionIDKey%22%3A%22x-amz-cf-id%22%2C%22sessionIDTable%22%3A%22Base62%22%2C%22sessionIDLength%22%3A%2216-32%22%2C%22seqPlacement%22%3A%22header%22%2C%22seqKey%22%3A%22x-amz-cf-pop%22%2C%22sessionPlacement%22%3A%22header%22%2C%22sessionKey%22%3A%22x-amz-cf-id%22%7D&security=tls&sni=thebestfilms.site&fp=chrome&alpn=h2#b2prss8u2-nginx%3Athebestfilms.site';
++const baseURI = 'vless://11111111-1111-4111-8111-111111111111@example.com:443?type=xhttp';
++const makeExtraURI = (extra) => `${baseURI}&extra=${encodeURIComponent(JSON.stringify(extra))}`;
++const outboundFrom = (uri) => Outbound.fromLink(uri);
++const importedAcceptance = plain(outboundFrom(acceptedURI).toJson());
++const importedXHTTP = importedAcceptance.streamSettings.xhttpSettings;
++
++let passed = 0;
++function test(name, callback) {
++    callback();
++    passed += 1;
++    if (!runtimeConfigMode) process.stdout.write(`PASS ${name}\n`);
++}
++
++test('1 single-encoded acceptance URI imports advanced XHTTP fields', () => {
++    assert.equal(importedXHTTP.sessionIDTable, 'Base62');
++    assert.equal(importedXHTTP.sessionIDLength, '16-32');
++    assert.equal(importedXHTTP.xPaddingBytes, '128-1120');
++    assert.equal(importedXHTTP.xPaddingObfsMode, true);
++    assert.equal(importedXHTTP.uplinkHTTPMethod, 'POST');
++    assert.equal(importedXHTTP.seqPlacement, 'header');
++});
++
++test('2 legacy session aliases import as canonical runtime names', () => {
++    const settings = plain(outboundFrom(makeExtraURI({
++        sessionPlacement: 'header',
++        sessionKey: 'x-amz-cf-id',
++    })).toJson()).streamSettings.xhttpSettings;
++    assert.equal(settings.sessionIDPlacement, 'header');
++    assert.equal(settings.sessionIDKey, 'x-amz-cf-id');
++    assert.equal(Object.hasOwn(settings, 'sessionPlacement'), false);
++    assert.equal(Object.hasOwn(settings, 'sessionKey'), false);
++});
++
++test('3 canonical session fields take priority over legacy aliases', () => {
++    const settings = plain(outboundFrom(makeExtraURI({
++        sessionIDPlacement: 'query',
++        sessionPlacement: 'header',
++        sessionIDKey: 'canonical-id',
++        sessionKey: 'legacy-id',
++    })).toJson()).streamSettings.xhttpSettings;
++    assert.equal(settings.sessionIDPlacement, 'query');
++    assert.equal(settings.sessionIDKey, 'canonical-id');
++});
++
++test('4 top-level URI path, host and mode override extra values', () => {
++    const uri = `${baseURI}&path=%2Ftop&host=top.example&mode=stream-one&extra=${encodeURIComponent(JSON.stringify({ path: '/extra', host: 'extra.example', mode: 'packet-up', sessionIDTable: 'Base62' }))}`;
++    const settings = plain(outboundFrom(uri).toJson()).streamSettings.xhttpSettings;
++    assert.equal(settings.path, '/top');
++    assert.equal(settings.host, 'top.example');
++    assert.equal(settings.mode, 'stream-one');
++    assert.equal(settings.sessionIDTable, 'Base62');
++});
++
++test('5 double-encoded extra gets one safe fallback decode', () => {
++    const encoded = encodeURIComponent(encodeURIComponent(JSON.stringify({ sessionIDTable: 'Base62' })));
++    const settings = plain(outboundFrom(`${baseURI}&extra=${encoded}`).toJson()).streamSettings.xhttpSettings;
++    assert.equal(settings.sessionIDTable, 'Base62');
++});
++
++test('6 malformed extra is ignored while the base outbound imports', () => {
++    const outbound = outboundFrom(`${baseURI}&path=%2Fkept&extra=%7Bbad%7D`);
++    assert.ok(outbound);
++    const result = plain(outbound.toJson());
++    assert.equal(result.protocol, 'vless');
++    assert.equal(result.streamSettings.xhttpSettings.path, '/kept');
++});
++
++test('extra is scoped to xhttpSettings and cannot rewrite outbound fields', () => {
++    const uri = `${baseURI}&security=tls&sni=safe.example&extra=${encodeURIComponent(JSON.stringify({
++        protocol: 'freedom',
++        address: 'attacker.example',
++        port: 1,
++        id: 'attacker-id',
++        tag: 'attacker-tag',
++        routing: { rules: [] },
++        sessionIDTable: 'Base62',
++    }))}`;
++    const outbound = plain(outboundFrom(uri).toJson());
++    assert.equal(outbound.protocol, 'vless');
++    assert.equal(outbound.settings.address, 'example.com');
++    assert.equal(outbound.settings.port, 443);
++    assert.equal(outbound.settings.id, '11111111-1111-4111-8111-111111111111');
++    assert.equal(outbound.streamSettings.security, 'tls');
++    assert.equal(outbound.streamSettings.tlsSettings.serverName, 'safe.example');
++    assert.notEqual(outbound.tag, 'attacker-tag');
++    assert.equal(Object.hasOwn(outbound, 'routing'), false);
++    assert.equal(outbound.streamSettings.xhttpSettings.sessionIDTable, 'Base62');
++});
++
++test('7 range strings retain their string values', () => {
++    const settings = plain(outboundFrom(makeExtraURI({
++        sessionIDLength: '16-32',
++        xPaddingBytes: '128-1120',
++        uplinkChunkSize: '2048-3072',
++    })).toJson()).streamSettings.xhttpSettings;
++    assert.equal(settings.sessionIDLength, '16-32');
++    assert.equal(settings.xPaddingBytes, '128-1120');
++    assert.equal(settings.uplinkChunkSize, '2048-3072');
++    assert.equal(typeof settings.uplinkChunkSize, 'string');
++});
++
++test('8 booleans and numeric chunk sizes retain their types', () => {
++    const settings = plain(outboundFrom(makeExtraURI({
++        xPaddingObfsMode: true,
++        uplinkChunkSize: 2048,
++    })).toJson()).streamSettings.xhttpSettings;
++    assert.equal(settings.xPaddingObfsMode, true);
++    assert.equal(typeof settings.xPaddingObfsMode, 'boolean');
++    assert.equal(settings.uplinkChunkSize, 2048);
++    assert.equal(typeof settings.uplinkChunkSize, 'number');
++});
++
++test('9 custom headers survive URI import and model serialization', () => {
++    const settings = plain(outboundFrom(`${baseURI}&host=top.example&extra=${encodeURIComponent(JSON.stringify({
++        headers: { 'User-Agent': 'golang' },
++    }))}`).toJson()).streamSettings.xhttpSettings;
++    assert.equal(settings.host, 'top.example');
++    assert.deepEqual(settings.headers, { 'User-Agent': 'golang' });
++});
++
++const manualXHTTP = {
++    path: '/videos/media/ts/1080/',
++    host: 'thebestfilms.site',
++    mode: 'stream-one',
++    noGRPCHeader: false,
++    noSSEHeader: false,
++    scMinPostsIntervalMs: '30',
++    scMaxBufferedPosts: 30,
++    serverMaxHeaderBytes: 16384,
++    xPaddingBytes: '128-1120',
++    xPaddingObfsMode: true,
++    xPaddingKey: 'X-Amz-Meta-Trace',
++    xPaddingHeader: 'X-Amz-Security-Token',
++    xPaddingPlacement: 'header',
++    xPaddingMethod: 'tokenish',
++    uplinkHTTPMethod: 'POST',
++    sessionIDPlacement: 'header',
++    sessionIDKey: 'x-amz-cf-id',
++    sessionIDTable: 'Base62',
++    sessionIDLength: '16-32',
++    seqPlacement: 'header',
++    seqKey: 'x-amz-cf-pop',
++    scMaxEachPostBytes: '1000000',
++    headers: { 'User-Agent': 'golang' },
++    xmux: {
++        maxConcurrency: '16-32',
++        maxConnections: 0,
++        cMaxReuseTimes: 0,
++        hMaxRequestTimes: '600-900',
++        hMaxReusableSecs: '1800-3600',
++        hKeepAlivePeriod: 0,
++        futureXmuxField: 'preserved',
++    },
++};
++const manualOutbound = {
++    protocol: 'vless',
++    settings: {
++        address: 'thebestfilms.site',
++        port: 443,
++        id: '8d47dbeb-e742-4e08-8534-001e9a3d9482',
++        flow: '',
++        encryption: 'none',
++    },
++    streamSettings: {
++        network: 'xhttp',
++        security: 'tls',
++        tlsSettings: {
++            serverName: 'thebestfilms.site',
++            alpn: ['h2'],
++            fingerprint: 'chrome',
++        },
++        xhttpSettings: manualXHTTP,
++    },
++};
++const manualSaved = plain(Outbound.fromJson(manualOutbound).toJson());
++const manualReloaded = plain(Outbound.fromJson(plain(manualSaved)).toJson());
++const packetUpOutbound = {
++    ...manualOutbound,
++    streamSettings: {
++        ...manualOutbound.streamSettings,
++        xhttpSettings: {
++            ...manualXHTTP,
++            mode: 'packet-up',
++            uplinkDataPlacement: 'header',
++            uplinkDataKey: 'X-Payload',
++            uplinkChunkSize: '2048-3072',
++        },
++    },
++};
++const packetUpSaved = plain(Outbound.fromJson(packetUpOutbound).toJson());
++const packetUpReloaded = plain(Outbound.fromJson(plain(packetUpSaved)).toJson());
++
++test('10 existing xmux parameters and additional xmux fields survive', () => {
++    assert.deepEqual(manualReloaded.streamSettings.xhttpSettings.xmux, manualXHTTP.xmux);
++});
++
++test('11 manual JSON save and reload preserve all advanced XHTTP fields', () => {
++    const saved = manualReloaded.streamSettings.xhttpSettings;
++    for (const [key, value] of Object.entries(manualXHTTP)) {
++        assert.deepEqual(saved[key], value, `field ${key}`);
++    }
++});
++
++test('packet-up uplink data fields and range chunk size survive save and reload', () => {
++    const settings = packetUpReloaded.streamSettings.xhttpSettings;
++    assert.equal(settings.mode, 'packet-up');
++    assert.equal(settings.uplinkDataPlacement, 'header');
++    assert.equal(settings.uplinkDataKey, 'X-Payload');
++    assert.equal(settings.uplinkChunkSize, '2048-3072');
++    assert.equal(typeof settings.uplinkChunkSize, 'string');
++});
++
++test('12 runtime Xray outbound JSON carries the advanced settings', () => {
++    const runtimeJSON = JSON.stringify({ outbounds: [importedAcceptance] });
++    const runtime = JSON.parse(runtimeJSON);
++    assert.deepEqual(runtime.outbounds[0].streamSettings.xhttpSettings, importedXHTTP);
++    assert.equal(runtime.outbounds[0].streamSettings.tlsSettings.serverName, 'thebestfilms.site');
++    assert.deepEqual(runtime.outbounds[0].streamSettings.tlsSettings.alpn, ['h2']);
++});
++
++test('13 ordinary VLESS TCP outbound remains TCP without XHTTP settings', () => {
++    const outbound = plain(outboundFrom('vless://11111111-1111-4111-8111-111111111111@example.com:443?type=tcp&security=tls&sni=example.com&flow=xtls-rprx-vision').toJson());
++    assert.equal(outbound.protocol, 'vless');
++    assert.equal(outbound.streamSettings.network, 'tcp');
++    assert.equal(outbound.settings.flow, 'xtls-rprx-vision');
++    assert.equal(Object.hasOwn(outbound.streamSettings, 'xhttpSettings'), false);
++});
++
++test('14 ordinary XHTTP URI without extra retains its base settings', () => {
++    const outbound = plain(outboundFrom(`${baseURI}&path=%2Fx&host=example.com&mode=stream-one`).toJson());
++    assert.equal(outbound.streamSettings.network, 'xhttp');
++    assert.equal(outbound.streamSettings.xhttpSettings.path, '/x');
++    assert.equal(outbound.streamSettings.xhttpSettings.host, 'example.com');
++    assert.equal(outbound.streamSettings.xhttpSettings.mode, 'stream-one');
++});
++
++test('VLESS encryption and flow survive XHTTP URI import', () => {
++    const outbound = plain(outboundFrom(`${baseURI}&encryption=mlkem768x25519plus.native.0rtt.client&flow=xtls-rprx-vision`).toJson());
++    assert.equal(outbound.settings.encryption, 'mlkem768x25519plus.native.0rtt.client');
++    assert.equal(outbound.settings.flow, 'xtls-rprx-vision');
++});
++
++if (runtimeConfigMode) {
++    process.stdout.write(JSON.stringify({ log: { loglevel: 'warning' }, outbounds: [importedAcceptance] }));
++} else {
++    process.stdout.write(`\nAcceptance import xhttpSettings:\n${JSON.stringify(importedXHTTP, null, 2)}\n`);
++    process.stdout.write(`\nSave/reload xhttpSettings:\n${JSON.stringify(manualReloaded.streamSettings.xhttpSettings, null, 2)}\n`);
++    process.stdout.write(`\nRuntime Xray outbound:\n${JSON.stringify(importedAcceptance, null, 2)}\n`);
++    process.stdout.write(`\n${passed} outbound model tests passed\n`);
++}
+diff --git a/xray/config_outbound_test.go b/xray/config_outbound_test.go
+new file mode 100644
+index 0000000..56f9ae3
+--- /dev/null
++++ b/xray/config_outbound_test.go
+@@ -0,0 +1,38 @@
++package xray
++
++import (
++	"encoding/json"
++	"strings"
++	"testing"
++)
++
++func TestConfigPreservesAdvancedXHTTPOutboundSettings(t *testing.T) {
++	template := `{"outbounds":[{"protocol":"vless","settings":{"vnext":[{"address":"thebestfilms.site","port":443,"users":[{"id":"8d47dbeb-e742-4e08-8534-001e9a3d9482","encryption":"none"}]}]},"streamSettings":{"network":"xhttp","security":"tls","tlsSettings":{"serverName":"thebestfilms.site","alpn":["h2"],"fingerprint":"chrome"},"xhttpSettings":{"path":"/videos/media/ts/1080/","host":"thebestfilms.site","mode":"stream-one","xPaddingBytes":"128-1120","xPaddingObfsMode":true,"uplinkHTTPMethod":"POST","sessionIDPlacement":"header","sessionIDKey":"x-amz-cf-id","sessionIDTable":"Base62","sessionIDLength":"16-32","seqPlacement":"header","seqKey":"x-amz-cf-pop","uplinkChunkSize":"2048-3072","headers":{"User-Agent":"golang"},"xmux":{"maxConcurrency":"16-32","maxConnections":0,"hMaxRequestTimes":"600-900"}}}}]}`
++
++	var config Config
++	if err := json.Unmarshal([]byte(template), &config); err != nil {
++		t.Fatalf("unmarshal Xray template config: %v", err)
++	}
++	if len(config.OutboundConfigs) == 0 {
++		t.Fatal("outbound config was not loaded")
++	}
++
++	generated, err := json.Marshal(&config)
++	if err != nil {
++		t.Fatalf("marshal generated Xray config: %v", err)
++	}
++	for _, field := range []string{
++		`"network":"xhttp"`,
++		`"xPaddingBytes":"128-1120"`,
++		`"xPaddingObfsMode":true`,
++		`"sessionIDTable":"Base62"`,
++		`"sessionIDLength":"16-32"`,
++		`"uplinkChunkSize":"2048-3072"`,
++		`"headers":{"User-Agent":"golang"}`,
++		`"xmux":{"maxConcurrency":"16-32","maxConnections":0,"hMaxRequestTimes":"600-900"}`,
++	} {
++		if !strings.Contains(string(generated), field) {
++			t.Errorf("generated config lost %s: %s", field, generated)
++		}
++	}
++}
+__OUTBOUND_PATCH_END__
 __XHTTP_PATCH_EOF__

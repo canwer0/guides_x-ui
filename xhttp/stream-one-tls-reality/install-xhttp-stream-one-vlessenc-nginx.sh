@@ -4,8 +4,10 @@ umask 077
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 ASSET_DIR="$SCRIPT_DIR/assets"
 # Additive VLESS + XHTTP + VLESS Encryption + Vision inbounds behind nginx.
-# Reuses an existing HTTPS site when found; otherwise creates a catalog site.
-# Existing Xray inbounds are preserved. Reality uses a separate free port.
+# TLS mode: nginx owns public :443 and sends the XHTTP path to a loopback Xray inbound.
+# Reality mode: nginx stream owns public :443 and sends traffic to Xray Reality;
+# ordinary TLS falls back to the site's HTTPS vhost on loopback :9443.
+# In both mode, TLS XHTTP uses that same fallback/site path; existing inbounds survive.
 
 XUI_DIR="${XUI_MAIN_FOLDER:-/usr/local/x-ui}"
 DB="${XUI_DB_PATH:-/etc/x-ui/x-ui.db}"
@@ -82,9 +84,13 @@ REALITY_SNI=""
 REALITY_TARGET=""
 if [[ "$MODE" == reality || "$MODE" == both ]]; then
   REALITY_SNI="$DOMAIN"
-  REALITY_TARGET="127.0.0.1:443"
+  REALITY_TARGET="127.0.0.1:9443"
 fi
 SITE_NAME="$DOMAIN"
+SITE_HTTPS_LISTEN="listen 443 ssl http2;"
+if [[ "$MODE" == reality || "$MODE" == both ]]; then
+  SITE_HTTPS_LISTEN="listen 127.0.0.1:9443 ssl http2;"
+fi
 read -rsp '3x-ui password: ' XUI_PASS; printf '\n'
 [[ -n "$XUI_PASS" ]] || die "Panel password is required."
 
@@ -126,6 +132,7 @@ COMMITTED=0
 NGINX_CHANGED=0
 NGINX_BLOCK_ADDED=0
 NGINX_MODULE_ADDED=0
+NGINX_ORIGIN_MOVED=0
 mkdir -m 700 -p "$BACKUP" "$RESULT" "$PAYLOAD_DIR"
 cleanup(){
   rc=$?
@@ -139,6 +146,7 @@ cleanup(){
     rm -f "$STREAM_CONF" "$LOCATION_CONF"
     if [[ -n "$NGINX_VHOST" && -f "$NGINX_VHOST" && -f "$NGINX_HELPER" ]]; then python3 "$NGINX_HELPER" remove "$NGINX_VHOST" "$LOCATION_INCLUDE" >/dev/null 2>&1 || true; fi
     if (( NEW_SITE )); then rm -f "$NGINX_VHOST"; [[ -z "$SITE" ]] || rm -rf --one-file-system "$SITE"; fi
+    if (( NGINX_ORIGIN_MOVED && ! NEW_SITE )) && [[ -f "$BACKUP/site-vhost.conf" ]]; then cp -a "$BACKUP/site-vhost.conf" "$NGINX_VHOST"; fi
     if (( NGINX_BLOCK_ADDED )); then
       python3 - "$NGINX_CONF" <<'PY'
 import pathlib,sys
@@ -230,8 +238,10 @@ def is_target(block,domain):
     names=re.findall(r'(?m)^\s*server_name\s+([^;]+);',block)
     listens=re.findall(r'(?m)^\s*listen\s+([^;]+);',block)
     has_name=any(domain in value.split() for value in names)
-    has_443_tls=any((value.split()[0]=='443' or value.split()[0].endswith(':443')) and 'ssl' in value.split()[1:] for value in listens if value.split())
-    return has_name and has_443_tls
+    has_https=any(value.split() and 'ssl' in value.split()[1:] and
+        (value.split()[0]=='443' or value.split()[0].endswith(':443') or
+         value.split()[0] in ('127.0.0.1:9443','[::1]:9443')) for value in listens)
+    return has_name and has_https
 
 def find_in_file(path,domain):
     text=Path(path).read_text(errors='replace')
@@ -275,6 +285,24 @@ elif action=='claimed':
             names=re.findall(r'(?m)^\s*server_name\s+([^;]+);',block)
             if any(domain in value.split() for value in names): claimed.append(str(p.resolve()))
     print('yes' if claimed else 'no')
+elif action=='public-https-check':
+    domain=sys.argv[2]
+    result=subprocess.run(['nginx','-T'],stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True)
+    if result.returncode: raise SystemExit('nginx -T failed; no files changed.')
+    files=re.findall(r'^# configuration file (.+):\s*$',result.stdout,re.M)
+    foreign=[]
+    for name in dict.fromkeys(files):
+        p=Path(name)
+        if not p.is_file(): continue
+        for _,_,block in blocks(p.read_text(errors='replace')):
+            listens=re.findall(r'(?m)^\s*listen\s+([^;]+);',block)
+            serves_443=any(v.split() and 'ssl' in v.split()[1:] and
+                (v.split()[0]=='443' or v.split()[0].endswith(':443')) for v in listens)
+            if not serves_443: continue
+            names=re.findall(r'(?m)^\s*server_name\s+([^;]+);',block)
+            if not any(domain in value.split() for value in names): foreign.append(str(p.resolve()))
+    if foreign: raise SystemExit('Another HTTPS vhost also listens on public 443; refusing to capture it: '+', '.join(sorted(set(foreign))))
+    print('ok')
 elif action=='vhost-dir':
     path=sys.argv[2]
     text=Path(path).read_text(errors='replace')
@@ -295,6 +323,36 @@ elif action=='add':
     if include in text: raise SystemExit('Managed include already exists; refusing duplicate insertion.')
     _,end=matches[0]
     atomic_write(path,text[:end]+'\n    '+include+'\n'+text[end:])
+elif action in ('move-origin','restore-origin'):
+    path,domain=sys.argv[2:]
+    text=Path(path).read_text()
+    matches=[(a,b,block) for a,b,block in blocks(text) if is_target(block,domain)]
+    if len(matches)!=1: raise SystemExit('The HTTPS origin is missing or ambiguous; refusing to move its listener.')
+    start,end,block=matches[0]
+    want_from='443' if action=='move-origin' else '9443'
+    want_to='9443' if action=='move-origin' else '443'
+    segment=text[start:end+1]; edits=[]
+    for m in re.finditer(r'(?m)^(\s*listen\s+)([^;]+);',segment):
+        parts=m.group(2).split()
+        if not parts or 'ssl' not in parts[1:]: continue
+        address=parts[0]
+        if address.rsplit(':',1)[-1]!=want_from: continue
+        if action=='move-origin': host='[::1]' if address.startswith('[') else '127.0.0.1'
+        else: host='[::]' if address.startswith('[') else ''
+        new_address=(host+':'+want_to) if host else want_to
+        replacement=m.group(1)+new_address+(' '+' '.join(parts[1:]) if len(parts)>1 else '')+';'
+        edits.append((m.start(),m.end(),replacement))
+    if edits:
+        for a,b,replacement in reversed(edits): segment=segment[:a]+replacement+segment[b:]
+        atomic_write(path,text[:start]+segment+text[end+1:])
+        print('moved')
+    else:
+        listens=re.findall(r'(?m)^\s*listen\s+([^;]+);',block)
+        already=any(v.split() and 'ssl' in v.split()[1:] and
+            ((v.split()[0] in ('127.0.0.1:9443','[::1]:9443')) if action=='move-origin' else
+             (v.split()[0]=='443' or v.split()[0].endswith(':443'))) for v in listens)
+        if not already: raise SystemExit('The HTTPS origin listener is not in the expected location; refusing to edit it.')
+        print('already')
 elif action=='remove':
     path,include=sys.argv[2:]
     p=Path(path); text=p.read_text()
@@ -307,14 +365,21 @@ elif action=='http2':
     if len(matches)!=1: raise SystemExit('Existing HTTPS server block is ambiguous; refusing to install.')
     block=matches[0]
     listens=re.findall(r'(?m)^\s*listen\s+([^;]+);',block)
-    ipv4_h2=any(value.split() and value.split()[0]=='443' and 'ssl' in value.split()[1:] and 'http2' in value.split()[1:] for value in listens)
+    ipv4_h2=any(value.split() and value.split()[0].rsplit(':',1)[-1] in ('443','9443') and 'ssl' in value.split()[1:] and 'http2' in value.split()[1:] for value in listens)
     modern_h2=bool(re.search(r'(?m)^\s*http2\s+on\s*;',block))
-    if not (ipv4_h2 or modern_h2): raise SystemExit('The existing site does not enable HTTP/2 on IPv4 :443.')
+    if not (ipv4_h2 or modern_h2): raise SystemExit('The HTTPS origin does not enable HTTP/2.')
 else: raise SystemExit('unknown action')
 PY
 
 NGINX_VHOST="$(python3 "$NGINX_HELPER" find "$DOMAIN")" || die "Could not safely locate an HTTPS site for $DOMAIN."
 NGINX_DUMP="$(nginx -T 2>&1)" || die "Could not inspect nginx listeners."
+if [[ "$MODE" == reality || "$MODE" == both ]]; then
+  python3 "$NGINX_HELPER" public-https-check "$DOMAIN" >/dev/null || die "Reality needs exclusive public TCP :443; another HTTPS vhost is using it."
+  if compgen -G '/etc/nginx/streams-enabled/*.conf' >/dev/null \
+      && grep -Eq '^[[:space:]]*listen[[:space:]]+(\[::\]:)?443([[:space:];]|$)' /etc/nginx/streams-enabled/*.conf; then
+    die "An Nginx stream frontend already owns :443; add clients to its existing REALITY inbound instead of creating another frontend."
+  fi
+fi
 if [[ "$NGINX_VHOST" == '__NONE__' ]]; then
   [[ "$(python3 "$NGINX_HELPER" claimed "$DOMAIN")" == no ]] || die "Nginx already has a non-HTTPS vhost for $DOMAIN; refusing to create a conflicting site."
   for edge_port in 80 443; do
@@ -347,17 +412,20 @@ fi
 cp -a "$XRAY_CONFIG" "$BACKUP/config.json"
 cp -a "$NGINX_CONF" "$BACKUP/nginx.conf"
 [[ ! -f "$NGINX_VHOST" ]] || cp -a "$NGINX_VHOST" "$BACKUP/site-vhost.conf"
+if [[ ( "$MODE" == reality || "$MODE" == both ) && "$NGINX_VHOST" != '__NONE__' ]]; then
+  origin_state="$(python3 "$NGINX_HELPER" move-origin "$NGINX_VHOST" "$DOMAIN")" || die "Could not move the existing HTTPS site to loopback :9443."
+  if [[ "$origin_state" == moved ]]; then NGINX_ORIGIN_MOVED=1; NGINX_CHANGED=1; fi
+fi
 python3 - "$DB" "$BACKUP/x-ui.db" <<'PY'
 import sqlite3,sys
 with sqlite3.connect(sys.argv[1]) as a,sqlite3.connect(sys.argv[2]) as b:a.backup(b)
 PY
 
 freeport(){ local p; for _ in $(seq 1 200); do p=$((22000 + RANDOM % 20000)); if ! ss -H -ltn "sport = :$p" | grep -q .; then echo "$p"; return; fi; done; return 1; }
-freeedgeport(){ local p; for p in $(seq 8443 8499); do if [[ "$p" != "${1:-}" ]] && ! ss -H -ltn "sport = :$p" | grep -q . && ! grep -Eq "^[[:space:]]*listen[[:space:]]+([^;[:space:]]*:)?$p([[:space:];]|$)" <<<"$NGINX_DUMP"; then echo "$p"; return; fi; done; return 1; }
-TLS_PORT=""; REALITY_PORT=""; TLS_EDGE_PORT="443"; REALITY_EDGE_PORT=""; TLS_ID=""; REALITY_ID=""
+TLS_PORT=""; REALITY_PORT=""; TLS_EDGE_PORT="443"; REALITY_EDGE_PORT="443"; TLS_ID=""; REALITY_ID=""
 [[ "$MODE" == tls || "$MODE" == both ]] && TLS_PORT="$(freeport)" || true
 [[ "$MODE" == reality || "$MODE" == both ]] && REALITY_PORT="$(freeport)" || true
-[[ -n "$REALITY_PORT" ]] && REALITY_EDGE_PORT="$(freeedgeport "$TLS_EDGE_PORT")" || true
+[[ -n "$REALITY_PORT" ]] || REALITY_EDGE_PORT=""
 TLS_UUID="$(cat /proc/sys/kernel/random/uuid)"
 REALITY_UUID="$(cat /proc/sys/kernel/random/uuid)"
 SID="$(openssl rand -hex 8)"
@@ -503,7 +571,7 @@ server {
     location / { return 301 https://\$host\$request_uri; }
 }
 server {
-    listen 443 ssl http2;
+    $SITE_HTTPS_LISTEN
     server_name $DOMAIN;
     root $SITE;
     index index.html;
@@ -516,7 +584,7 @@ EOF
   log "New HTTPS catalog site prepared; the XHTTP route will be added after preflight."
 fi
 if [[ "$MODE" == tls || "$MODE" == both ]]; then
-  python3 "$NGINX_HELPER" http2 "$NGINX_VHOST" "$DOMAIN" || die "The HTTPS site must enable HTTP/2 on IPv4 :443 for XHTTP TLS; no inbound was added."
+  python3 "$NGINX_HELPER" http2 "$NGINX_VHOST" "$DOMAIN" || die "The HTTPS origin must enable HTTP/2; no inbound was added."
 fi
 
 if false; then
@@ -652,7 +720,7 @@ EOF
   python3 "$NGINX_HELPER" add "$NGINX_VHOST" "$DOMAIN" "$LOCATION_INCLUDE" || die "Could not add the XHTTP route; existing site was preserved."
 fi
 if [[ "$MODE" == reality || "$MODE" == both ]]; then
-  [[ -n "$REALITY_EDGE_PORT" ]] || die "No free public port in 8443-8499; existing site was not changed."
+  [[ "$REALITY_EDGE_PORT" == 443 ]] || die "Reality frontend must use public :443."
   NGINX_BUILD="$(nginx -V 2>&1)"
   if ! grep -Eq -- '--with-stream(=dynamic)?([[:space:]]|$)' <<<"$NGINX_BUILD"; then
     die "This Nginx build does not support the stream module."
@@ -688,7 +756,8 @@ if [[ "$MODE" == reality || "$MODE" == both ]]; then
   fi
   cat > "$STREAM_CONF" <<EOF
 server {
-    listen $REALITY_EDGE_PORT;
+    listen 443;
+    listen [::]:443;
     proxy_connect_timeout 5s;
     proxy_timeout 1h;
     proxy_pass 127.0.0.1:$REALITY_PORT;
@@ -765,6 +834,11 @@ python3 '$RESULT/xui-api.py' restart '$BASE' '$RESULT/auth'
 rm -f '$LOCATION_CONF' '$STREAM_CONF'
 python3 '$RESULT/nginx-vhost.py' remove '$NGINX_VHOST' '$LOCATION_INCLUDE'
 EOF
+if (( NGINX_ORIGIN_MOVED && ! NEW_SITE )); then
+  cat >> "$RESULT/remove.sh" <<EOF
+python3 '$RESULT/nginx-vhost.py' restore-origin '$NGINX_VHOST' '$DOMAIN'
+EOF
+fi
 if (( NEW_SITE )); then
   cat >> "$RESULT/remove.sh" <<EOF
 rm -f '$NGINX_VHOST'

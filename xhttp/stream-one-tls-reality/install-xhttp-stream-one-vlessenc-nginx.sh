@@ -125,6 +125,7 @@ CREATED_IDS=()
 COMMITTED=0
 NGINX_CHANGED=0
 NGINX_BLOCK_ADDED=0
+NGINX_MODULE_ADDED=0
 mkdir -m 700 -p "$BACKUP" "$RESULT" "$PAYLOAD_DIR"
 cleanup(){
   rc=$?
@@ -143,6 +144,17 @@ cleanup(){
 import pathlib,sys
 p=pathlib.Path(sys.argv[1])
 line='stream { include /etc/nginx/streams-enabled/*.conf; }'
+if p.exists():
+    lines=p.read_text().splitlines(keepends=True)
+    kept=[x for x in lines if x.strip()!=line]
+    if len(kept)!=len(lines): p.write_text(''.join(kept))
+PY
+    fi
+    if (( NGINX_MODULE_ADDED )); then
+      python3 - "$NGINX_CONF" <<'PY'
+import pathlib,sys
+p=pathlib.Path(sys.argv[1])
+line='load_module /usr/lib/nginx/modules/ngx_stream_module.so;'
 if p.exists():
     lines=p.read_text().splitlines(keepends=True)
     kept=[x for x in lines if x.strip()!=line]
@@ -630,9 +642,9 @@ location ^~ $PATH_XHTTP {
     grpc_send_timeout 1h;
     client_body_timeout 1h;
     client_max_body_size 0;
-    grpc_set_header Host \\$host;
-    grpc_set_header X-Real-IP \\$remote_addr;
-    grpc_set_header X-Forwarded-For \\$proxy_add_x_forwarded_for;
+    grpc_set_header Host \$host;
+    grpc_set_header X-Real-IP \$remote_addr;
+    grpc_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
     grpc_pass grpc://127.0.0.1:$TLS_PORT;
 }
 EOF
@@ -641,13 +653,28 @@ EOF
 fi
 if [[ "$MODE" == reality || "$MODE" == both ]]; then
   [[ -n "$REALITY_EDGE_PORT" ]] || die "No free public port in 8443-8499; existing site was not changed."
-  if ! nginx -V 2>&1 | grep -Eq -- '--with-stream|stream=dynamic'; then
-    command -v apt-get >/dev/null 2>&1 || die "nginx stream module is unavailable."
-    export DEBIAN_FRONTEND=noninteractive
-    apt-get update
-    apt-get install -y libnginx-mod-stream
+  NGINX_BUILD="$(nginx -V 2>&1)"
+  if ! grep -Eq -- '--with-stream(=dynamic)?([[:space:]]|$)' <<<"$NGINX_BUILD"; then
+    die "This Nginx build does not support the stream module."
   fi
-  if nginx -T 2>/dev/null | grep -Eq '^[[:space:]]*stream[[:space:]]*\{' \
+  if grep -q -- '--with-stream=dynamic' <<<"$NGINX_BUILD" \
+      && ! grep -Eq '^[[:space:]]*load_module[[:space:]]+[^;]*ngx_stream_module\.so[[:space:]]*;' <<<"$NGINX_DUMP"; then
+    if [[ ! -f /usr/lib/nginx/modules/ngx_stream_module.so ]]; then
+      command -v apt-get >/dev/null 2>&1 || die "nginx stream module is missing and apt-get is unavailable."
+      export DEBIAN_FRONTEND=noninteractive
+      apt-get update
+      apt-get install -y libnginx-mod-stream
+    fi
+    [[ -f /usr/lib/nginx/modules/ngx_stream_module.so ]] || die "nginx stream module was not installed."
+    NGINX_DUMP="$(nginx -T 2>&1)" || die "Could not inspect nginx after installing its stream module."
+    if ! grep -Eq '^[[:space:]]*load_module[[:space:]]+[^;]*ngx_stream_module\.so[[:space:]]*;' <<<"$NGINX_DUMP"; then
+      sed -i '1i load_module /usr/lib/nginx/modules/ngx_stream_module.so;' "$NGINX_CONF"
+      NGINX_MODULE_ADDED=1
+      NGINX_CHANGED=1
+    fi
+  fi
+  NGINX_DUMP="$(nginx -T 2>&1)" || die "Could not inspect nginx after enabling its stream module."
+  if grep -Eq '^[[:space:]]*stream[[:space:]]*\{' <<<"$NGINX_DUMP" \
       && ! grep -q 'streams-enabled/\*.conf' "$NGINX_CONF"; then
     die "nginx has an unmanaged stream{} block; refusing to alter it. Existing site and inbounds are preserved."
   fi
@@ -744,9 +771,13 @@ rm -f '$NGINX_VHOST'
 rm -rf --one-file-system '$SITE'
 EOF
 fi
-if (( NGINX_BLOCK_ADDED )); then
+if (( NGINX_BLOCK_ADDED || NGINX_MODULE_ADDED )); then
   cat >> "$RESULT/remove.sh" <<EOF
 if ! compgen -G '/etc/nginx/streams-enabled/*.conf' >/dev/null; then
+EOF
+fi
+if (( NGINX_BLOCK_ADDED )); then
+  cat >> "$RESULT/remove.sh" <<EOF
   python3 - '$NGINX_CONF' <<'PY'
 import pathlib,sys
 p=pathlib.Path(sys.argv[1]); line='stream { include /etc/nginx/streams-enabled/*.conf; }'
@@ -755,6 +786,22 @@ if p.exists():
     kept=[x for x in lines if x.strip()!=line]
     if len(kept)!=len(lines): p.write_text(''.join(kept))
 PY
+EOF
+fi
+if (( NGINX_MODULE_ADDED )); then
+  cat >> "$RESULT/remove.sh" <<EOF
+  python3 - '$NGINX_CONF' <<'PY'
+import pathlib,sys
+p=pathlib.Path(sys.argv[1]); line='load_module /usr/lib/nginx/modules/ngx_stream_module.so;'
+if p.exists():
+    lines=p.read_text().splitlines(keepends=True)
+    kept=[x for x in lines if x.strip()!=line]
+    if len(kept)!=len(lines): p.write_text(''.join(kept))
+PY
+EOF
+fi
+if (( NGINX_BLOCK_ADDED || NGINX_MODULE_ADDED )); then
+  cat >> "$RESULT/remove.sh" <<EOF
 fi
 EOF
 fi

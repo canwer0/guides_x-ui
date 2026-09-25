@@ -88,13 +88,8 @@ DOMAIN="$(printf '%s' "$DOMAIN" | tr '[:upper:]' '[:lower:]' | sed 's/[.]$//')"
 REALITY_SNI=""
 REALITY_TARGET=""
 if [[ "$MODE" == reality || "$MODE" == both ]]; then
-  read -rp 'REALITY serverName/SNI (different from site domain): ' REALITY_SNI
-  REALITY_SNI="$(printf '%s' "$REALITY_SNI" | tr '[:upper:]' '[:lower:]' | sed 's/[.]$//')"
-  [[ "$REALITY_SNI" =~ ^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?[.])+[a-z]{2,63}$ ]] || die "Invalid REALITY SNI."
-  [[ "$REALITY_SNI" != "$DOMAIN" ]] || die "For nginx SNI routing, REALITY SNI must differ from the site domain."
-  read -rp "REALITY target [${REALITY_SNI}:443]: " REALITY_TARGET
-  REALITY_TARGET="${REALITY_TARGET:-$REALITY_SNI:443}"
-  [[ "$REALITY_TARGET" =~ ^([A-Za-z0-9.-]+):[0-9]{1,5}$ ]] || die "Target must be hostname:port."
+  REALITY_SNI="$DOMAIN"
+  REALITY_TARGET="127.0.0.1:9443"
 fi
 read -rp 'Site title: ' SITE_NAME
 [[ -n "$SITE_NAME" && ${#SITE_NAME} -le 80 ]] || die "Site title is required (max 80 chars)."
@@ -192,6 +187,8 @@ TLS_UUID="$(cat /proc/sys/kernel/random/uuid)"
 REALITY_UUID="$(cat /proc/sys/kernel/random/uuid)"
 SID="$(openssl rand -hex 8)"
 REALITY_KEYS=""
+REALITY_PRIVATE=""
+REALITY_PUBLIC=""
 if [[ "$MODE" == reality || "$MODE" == both ]]; then
   REALITY_KEYS="$("$XRAY" x25519 2>&1)" || die "xray x25519 failed."
   readarray -t REALITY_KEYPAIR < <(printf '%s\n' "$REALITY_KEYS" | python3 -c '
@@ -334,7 +331,7 @@ EOF
 fi
 
 # In Reality mode, nginx stream is the public :443 listener. It dispatches the
-# distinct Reality SNI to Xray and all other names to the local HTTPS origin.
+# this domain to Xray. Ordinary TLS is relayed by REALITY to the local HTTPS origin.
 if [[ "$MODE" == reality || "$MODE" == both ]]; then
   mkdir -p /etc/nginx/streams-enabled
   if ! grep -q 'streams-enabled/\*.conf' "$NGINX_CONF"; then
@@ -343,7 +340,7 @@ if [[ "$MODE" == reality || "$MODE" == both ]]; then
   fi
   cat > "$STREAM_CONF" <<EOF
 map \$ssl_preread_server_name \$stream_one_upstream {
-    $REALITY_SNI 127.0.0.1:$REALITY_PORT;
+    $DOMAIN 127.0.0.1:$REALITY_PORT;
     default 127.0.0.1:9443;
 }
 server {

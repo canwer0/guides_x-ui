@@ -34,7 +34,7 @@ command -v nginx >/dev/null 2>&1 || PACKAGES+=(nginx)
 command -v ip >/dev/null 2>&1 || PACKAGES+=(iproute2)
 command -v curl >/dev/null 2>&1 || PACKAGES+=(curl)
 command -v certbot >/dev/null 2>&1 || PACKAGES+=(certbot)
-if (('${#PACKAGES[@]}')); then
+if ((${#PACKAGES[@]})); then
   command -v apt-get >/dev/null 2>&1 || die "Missing packages ${PACKAGES[*]}; automatic installation requires apt-get."
   export DEBIAN_FRONTEND=noninteractive
   apt-get update

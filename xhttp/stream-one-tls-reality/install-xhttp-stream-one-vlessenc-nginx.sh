@@ -3,13 +3,9 @@ set -Eeuo pipefail
 umask 077
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 ASSET_DIR="$SCRIPT_DIR/assets"
-
-# VLESS + XHTTP stream-one + VLESS Encryption + Vision behind nginx.
-# Modes:
-#   tls     nginx terminates HTTPS and proxies h2c to loopback Xray.
-#   reality nginx stream routes by SNI to a loopback Xray REALITY inbound.
-#   both    both inbounds share :443 via nginx stream/SNI; site TLS and REALITY
-#           use distinct SNI names.
+# Additive VLESS + XHTTP + VLESS Encryption + Vision inbounds behind nginx.
+# Reuses an existing HTTPS site when found; otherwise creates a catalog site.
+# Existing Xray inbounds are preserved. Reality uses a separate free port.
 
 XUI_DIR="${XUI_MAIN_FOLDER:-/usr/local/x-ui}"
 DB="${XUI_DB_PATH:-/etc/x-ui/x-ui.db}"
@@ -23,24 +19,21 @@ BACKUP_ROOT="/root/xhttp-stream-one-backups"
 log(){ printf '[stream-one] %s\n' "$*"; }
 die(){ printf '[stream-one] ERROR: %s\n' "$*" >&2; exit 1; }
 need(){ command -v "$1" >/dev/null 2>&1 || die "Missing command: $1"; }
+nginx_apply(){ nginx -t || return; if systemctl is-active --quiet nginx; then systemctl reload nginx; else systemctl start nginx; fi; }
 [[ $EUID -eq 0 ]] || die "Run as root."
-for poster in poster-orbit.webp poster-noir.webp poster-summit.webp poster-afterglow.webp; do
-  [[ -f "$ASSET_DIR/$poster" ]] || die "Bundled cover art missing: $ASSET_DIR/$poster (extract the full package, not only the .sh file)."
-done
 PACKAGES=()
 command -v python3 >/dev/null 2>&1 || PACKAGES+=(python3)
 command -v openssl >/dev/null 2>&1 || PACKAGES+=(openssl)
 command -v nginx >/dev/null 2>&1 || PACKAGES+=(nginx)
 command -v ip >/dev/null 2>&1 || PACKAGES+=(iproute2)
 command -v curl >/dev/null 2>&1 || PACKAGES+=(curl)
-command -v certbot >/dev/null 2>&1 || PACKAGES+=(certbot)
 if ((${#PACKAGES[@]})); then
   command -v apt-get >/dev/null 2>&1 || die "Missing packages ${PACKAGES[*]}; automatic installation requires apt-get."
   export DEBIAN_FRONTEND=noninteractive
   apt-get update
   apt-get install -y --no-install-recommends "${PACKAGES[@]}"
 fi
-for c in python3 openssl nginx systemctl ss curl certbot sha256sum awk sed grep; do need "$c"; done
+for c in python3 openssl nginx systemctl ss curl sha256sum awk sed grep; do need "$c"; done
 [[ -x "$PANEL" && -f "$DB" && -f "$XRAY_CONFIG" ]] || die "3x-ui/Xray files were not found under $XUI_DIR."
 XRAY="$(find "$XUI_DIR/bin" -maxdepth 1 -type f -name 'xray-linux-*' -perm -111 -print -quit)"
 [[ -n "$XRAY" ]] || die "Xray binary not found."
@@ -89,10 +82,9 @@ REALITY_SNI=""
 REALITY_TARGET=""
 if [[ "$MODE" == reality || "$MODE" == both ]]; then
   REALITY_SNI="$DOMAIN"
-  REALITY_TARGET="127.0.0.1:9443"
+  REALITY_TARGET="127.0.0.1:443"
 fi
-read -rp 'Site title: ' SITE_NAME
-[[ -n "$SITE_NAME" && ${#SITE_NAME} -le 80 ]] || die "Site title is required (max 80 chars)."
+SITE_NAME="$DOMAIN"
 read -rsp '3x-ui password: ' XUI_PASS; printf '\n'
 [[ -n "$XUI_PASS" ]] || die "Panel password is required."
 
@@ -114,22 +106,26 @@ PY
 )"
 DEPLOY="$(openssl rand -hex 6)"
 PATH_XHTTP="/x-$(openssl rand -hex 18)/"
-ASSET_ROUTE="/catalog-$(openssl rand -hex 12)"
-ORBIT_FILE="$(openssl rand -hex 8).webp"
-NOIR_FILE="$(openssl rand -hex 8).webp"
-SUMMIT_FILE="$(openssl rand -hex 8).webp"
-AFTERGLOW_FILE="$(openssl rand -hex 8).webp"
-SITE="/var/www/movie-$DEPLOY"
 RESULT="$RESULT_ROOT-$DEPLOY"
 BACKUP="$BACKUP_ROOT/$(date -u +%Y%m%dT%H%M%SZ)-$DEPLOY"
-VHOST="/etc/nginx/conf.d/stream-one-$DEPLOY.conf"
 STREAM_CONF="/etc/nginx/streams-enabled/stream-one-$DEPLOY.conf"
+LOCATION_DIR="/etc/nginx/stream-one-locations"
+LOCATION_CONF="$LOCATION_DIR/$DEPLOY.conf"
+LOCATION_INCLUDE="include $LOCATION_CONF;"
 HELPER="/tmp/xui-api-$DEPLOY.py"
+NGINX_HELPER="/tmp/nginx-vhost-$DEPLOY.py"
+NGINX_VHOST=""
+VHOST_DIR=""
+SITE=""
+ASSET_ROUTE=""
+NEW_SITE=0
 AUTH="/tmp/xui-auth-$DEPLOY"
 PAYLOAD_DIR="/tmp/xui-payload-$DEPLOY"
 CREATED_IDS=()
 COMMITTED=0
-mkdir -m 700 -p "$BACKUP" "$RESULT" "$SITE" "$PAYLOAD_DIR"
+NGINX_CHANGED=0
+NGINX_BLOCK_ADDED=0
+mkdir -m 700 -p "$BACKUP" "$RESULT" "$PAYLOAD_DIR"
 cleanup(){
   rc=$?
   if (( rc != 0 && COMMITTED == 0 )); then
@@ -139,22 +135,28 @@ cleanup(){
     if (("${#CREATED_IDS[@]}" > 0)) && [[ -f "$HELPER" && -f "$AUTH" ]]; then
       python3 "$HELPER" restart "$BASE" "$AUTH" >/dev/null 2>&1 || true
     fi
-    rm -f "$VHOST" "$STREAM_CONF"
-    [[ -f "$BACKUP/nginx.conf.before-stream" ]] && cp -a "$BACKUP/nginx.conf.before-stream" "$NGINX_CONF"
-    rm -rf --one-file-system "$SITE"
-    nginx -t >/dev/null 2>&1 && systemctl reload nginx >/dev/null 2>&1 || true
+    rm -f "$STREAM_CONF" "$LOCATION_CONF"
+    if [[ -n "$NGINX_VHOST" && -f "$NGINX_VHOST" && -f "$NGINX_HELPER" ]]; then python3 "$NGINX_HELPER" remove "$NGINX_VHOST" "$LOCATION_INCLUDE" >/dev/null 2>&1 || true; fi
+    if (( NEW_SITE )); then rm -f "$NGINX_VHOST"; [[ -z "$SITE" ]] || rm -rf --one-file-system "$SITE"; fi
+    if (( NGINX_BLOCK_ADDED )); then
+      python3 - "$NGINX_CONF" <<'PY'
+import pathlib,sys
+p=pathlib.Path(sys.argv[1])
+line='stream { include /etc/nginx/streams-enabled/*.conf; }'
+if p.exists():
+    lines=p.read_text().splitlines(keepends=True)
+    kept=[x for x in lines if x.strip()!=line]
+    if len(kept)!=len(lines): p.write_text(''.join(kept))
+PY
+    fi
+    if (( NGINX_CHANGED )); then nginx_apply >/dev/null 2>&1 || true; fi
+    rm -rf --one-file-system "$RESULT"
   fi
-  rm -f "$HELPER" "$AUTH" "$PAYLOAD_DIR"/* /tmp/xray-"$DEPLOY"-*.json
+  rm -f "$HELPER" "$NGINX_HELPER" "$AUTH" "$PAYLOAD_DIR"/* /tmp/xray-"$DEPLOY"-*.json
   unset XUI_PASS VLESS_DEC VLESS_ENC VLESSENC_RAW
 }
 trap cleanup EXIT
 printf '%s\n%s\n' "$XUI_USER" "$XUI_PASS" > "$AUTH"; chmod 600 "$AUTH"
-cp -a "$XRAY_CONFIG" "$BACKUP/config.json"
-cp -a "$NGINX_CONF" "$BACKUP/nginx.conf"
-python3 - "$DB" "$BACKUP/x-ui.db" <<'PY'
-import sqlite3,sys
-with sqlite3.connect(sys.argv[1]) as a,sqlite3.connect(sys.argv[2]) as b:a.backup(b)
-PY
 
 install -m 700 /dev/stdin "$HELPER" <<'PY'
 #!/usr/bin/env python3
@@ -179,10 +181,171 @@ elif action=="del":call("/panel/api/inbounds/del/"+sys.argv[3],{})
 elif action=="restart":call("/panel/api/server/restartXrayService",{})
 PY
 
+install -m 700 /dev/stdin "$NGINX_HELPER" <<'PY'
+#!/usr/bin/env python3
+import os,re,stat,subprocess,sys,tempfile
+from pathlib import Path
+
+def mask(text):
+    out=list(text); quote=None; escape=False; comment=False; i=0
+    while i<len(text):
+        c=text[i]
+        if comment:
+            if c=='\n': comment=False
+            else: out[i]=' '
+        elif quote:
+            out[i]=' '
+            if escape: escape=False
+            elif c=='\\': escape=True
+            elif c==quote: quote=None
+        elif c in "\"'": quote=c; out[i]=' '
+        elif c=='#': comment=True; out[i]=' '
+        i+=1
+    return ''.join(out)
+
+def blocks(text,kind='server'):
+    masked=mask(text)
+    for m in re.finditer(r'\b'+re.escape(kind)+r'\s*\{',masked):
+        opening=masked.find('{',m.start(),m.end()); depth=0; end=None
+        for i in range(opening,len(masked)):
+            if masked[i]=='{': depth+=1
+            elif masked[i]=='}':
+                depth-=1
+                if depth==0: end=i; break
+        if end is not None: yield m.start(),end,masked[m.start():end+1]
+
+def is_target(block,domain):
+    names=re.findall(r'(?m)^\s*server_name\s+([^;]+);',block)
+    listens=re.findall(r'(?m)^\s*listen\s+([^;]+);',block)
+    has_name=any(domain in value.split() for value in names)
+    has_443_tls=any((value.split()[0]=='443' or value.split()[0].endswith(':443')) and 'ssl' in value.split()[1:] for value in listens if value.split())
+    return has_name and has_443_tls
+
+def find_in_file(path,domain):
+    text=Path(path).read_text(errors='replace')
+    return [(start,end) for start,end,block in blocks(text) if is_target(block,domain)]
+
+def atomic_write(path,text):
+    p=Path(path); st=p.stat()
+    fd,tmp=tempfile.mkstemp(prefix=p.name+'.',dir=str(p.parent))
+    try:
+        with os.fdopen(fd,'w') as f: f.write(text); f.flush(); os.fsync(f.fileno())
+        os.chmod(tmp,stat.S_IMODE(st.st_mode))
+        os.replace(tmp,p)
+    finally:
+        if os.path.exists(tmp): os.unlink(tmp)
+
+action=sys.argv[1]
+if action=='find':
+    domain=sys.argv[2]
+    result=subprocess.run(['nginx','-T'],stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True)
+    if result.returncode: raise SystemExit('nginx -T failed; no files changed.')
+    files=re.findall(r'^# configuration file (.+):\s*$',result.stdout,re.M)
+    matches=[]
+    for name in dict.fromkeys(files):
+        p=Path(name)
+        if not p.is_file(): continue
+        resolved=str(p.resolve())
+        for start,end in find_in_file(resolved,domain): matches.append((resolved,start,end))
+    unique={(p,s,e) for p,s,e in matches}
+    if len(unique)>1: raise SystemExit('More than one HTTPS server block matches '+domain+'; refusing an ambiguous edit.')
+    print(next(iter(unique))[0] if unique else '__NONE__')
+elif action=='claimed':
+    domain=sys.argv[2]
+    result=subprocess.run(['nginx','-T'],stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True)
+    if result.returncode: raise SystemExit('nginx -T failed; no files changed.')
+    files=re.findall(r'^# configuration file (.+):\s*$',result.stdout,re.M)
+    claimed=[]
+    for name in dict.fromkeys(files):
+        p=Path(name)
+        if not p.is_file(): continue
+        for _,_,block in blocks(p.read_text(errors='replace')):
+            names=re.findall(r'(?m)^\s*server_name\s+([^;]+);',block)
+            if any(domain in value.split() for value in names): claimed.append(str(p.resolve()))
+    print('yes' if claimed else 'no')
+elif action=='vhost-dir':
+    path=sys.argv[2]
+    text=Path(path).read_text(errors='replace')
+    candidates=[]
+    for _,_,block in blocks(text,'http'):
+        includes=re.findall(r'(?m)^\s*include\s+([^;]+);',block)
+        for value in includes:
+            if value.endswith('/conf.d/*.conf'): candidates.append(value[:-len('/*.conf')])
+            elif value.endswith('/sites-enabled/*'): candidates.append(value[:-len('/*')])
+    for directory in candidates:
+        if Path(directory).is_dir(): print(directory); break
+    else: raise SystemExit('No standard included nginx vhost directory was found; refusing to change nginx.conf.')
+elif action=='add':
+    path,domain,include=sys.argv[2:]
+    text=Path(path).read_text()
+    matches=find_in_file(path,domain)
+    if len(matches)!=1: raise SystemExit('The existing HTTPS server block changed or is ambiguous; refusing to edit it.')
+    if include in text: raise SystemExit('Managed include already exists; refusing duplicate insertion.')
+    _,end=matches[0]
+    atomic_write(path,text[:end]+'\n    '+include+'\n'+text[end:])
+elif action=='remove':
+    path,include=sys.argv[2:]
+    p=Path(path); text=p.read_text()
+    lines=text.splitlines(keepends=True)
+    kept=[line for line in lines if line.strip()!=include]
+    if len(kept)!=len(lines): atomic_write(path,''.join(kept))
+elif action=='http2':
+    path,domain=sys.argv[2:]
+    matches=[block for _,_,block in blocks(Path(path).read_text(errors='replace')) if is_target(block,domain)]
+    if len(matches)!=1: raise SystemExit('Existing HTTPS server block is ambiguous; refusing to install.')
+    block=matches[0]
+    listens=re.findall(r'(?m)^\s*listen\s+([^;]+);',block)
+    ipv4_h2=any(value.split() and value.split()[0]=='443' and 'ssl' in value.split()[1:] and 'http2' in value.split()[1:] for value in listens)
+    modern_h2=bool(re.search(r'(?m)^\s*http2\s+on\s*;',block))
+    if not (ipv4_h2 or modern_h2): raise SystemExit('The existing site does not enable HTTP/2 on IPv4 :443.')
+else: raise SystemExit('unknown action')
+PY
+
+NGINX_VHOST="$(python3 "$NGINX_HELPER" find "$DOMAIN")" || die "Could not safely locate an HTTPS site for $DOMAIN."
+NGINX_DUMP="$(nginx -T 2>&1)" || die "Could not inspect nginx listeners."
+if [[ "$NGINX_VHOST" == '__NONE__' ]]; then
+  [[ "$(python3 "$NGINX_HELPER" claimed "$DOMAIN")" == no ]] || die "Nginx already has a non-HTTPS vhost for $DOMAIN; refusing to create a conflicting site."
+  for edge_port in 80 443; do
+    edge_listeners="$(ss -H -ltnp "sport = :$edge_port")"
+    if [[ -n "$edge_listeners" ]] && ! grep -q 'users:(("nginx"' <<<"$edge_listeners"; then
+      die "Port $edge_port is owned by a non-Nginx service; refusing to take it over for the new site."
+    fi
+  done
+  NEW_SITE=1
+  VHOST_DIR="$(python3 "$NGINX_HELPER" vhost-dir "$NGINX_CONF")" || die "Cannot find an included Nginx vhost directory; nothing was changed."
+  NGINX_VHOST="$VHOST_DIR/stream-one-$DEPLOY.conf"
+  SITE="/var/www/stream-one-$DEPLOY"
+  ASSET_ROUTE="/media-$(openssl rand -hex 10)"
+  CERT="/etc/letsencrypt/live/$DOMAIN/fullchain.pem"
+  KEY="/etc/letsencrypt/live/$DOMAIN/privkey.pem"
+  [[ ! -e "$NGINX_VHOST" && ! -e "$SITE" ]] || die "Refusing to overwrite a pre-existing generated path."
+  for image in poster-orbit.webp poster-noir.webp poster-summit.webp poster-afterglow.webp; do
+    [[ -r "$ASSET_DIR/$image" ]] || die "Artwork is missing ($ASSET_DIR/$image); upload the assets folder with the installer."
+  done
+  read -rp 'New site title [Film collection]: ' SITE_NAME
+  SITE_NAME="${SITE_NAME:-Film collection}"
+  ORBIT_FILE="p-$(openssl rand -hex 8).webp"
+  NOIR_FILE="p-$(openssl rand -hex 8).webp"
+  SUMMIT_FILE="p-$(openssl rand -hex 8).webp"
+  AFTERGLOW_FILE="p-$(openssl rand -hex 8).webp"
+  log "No HTTPS site found; creating a new catalog site for $DOMAIN."
+else
+  log "Existing HTTPS site detected for $DOMAIN; it will be preserved."
+fi
+cp -a "$XRAY_CONFIG" "$BACKUP/config.json"
+cp -a "$NGINX_CONF" "$BACKUP/nginx.conf"
+[[ ! -f "$NGINX_VHOST" ]] || cp -a "$NGINX_VHOST" "$BACKUP/site-vhost.conf"
+python3 - "$DB" "$BACKUP/x-ui.db" <<'PY'
+import sqlite3,sys
+with sqlite3.connect(sys.argv[1]) as a,sqlite3.connect(sys.argv[2]) as b:a.backup(b)
+PY
+
 freeport(){ local p; for _ in $(seq 1 200); do p=$((22000 + RANDOM % 20000)); if ! ss -H -ltn "sport = :$p" | grep -q .; then echo "$p"; return; fi; done; return 1; }
-TLS_PORT=""; REALITY_PORT=""; TLS_ID=""; REALITY_ID=""
+freeedgeport(){ local p; for p in $(seq 8443 8499); do if [[ "$p" != "${1:-}" ]] && ! ss -H -ltn "sport = :$p" | grep -q . && ! grep -Eq "^[[:space:]]*listen[[:space:]]+([^;[:space:]]*:)?$p([[:space:];]|$)" <<<"$NGINX_DUMP"; then echo "$p"; return; fi; done; return 1; }
+TLS_PORT=""; REALITY_PORT=""; TLS_EDGE_PORT="443"; REALITY_EDGE_PORT=""; TLS_ID=""; REALITY_ID=""
 [[ "$MODE" == tls || "$MODE" == both ]] && TLS_PORT="$(freeport)" || true
 [[ "$MODE" == reality || "$MODE" == both ]] && REALITY_PORT="$(freeport)" || true
+[[ -n "$REALITY_PORT" ]] && REALITY_EDGE_PORT="$(freeedgeport "$TLS_EDGE_PORT")" || true
 TLS_UUID="$(cat /proc/sys/kernel/random/uuid)"
 REALITY_UUID="$(cat /proc/sys/kernel/random/uuid)"
 SID="$(openssl rand -hex 8)"
@@ -195,8 +358,10 @@ if [[ "$MODE" == reality || "$MODE" == both ]]; then
 import re,sys
 d={}
 for line in sys.stdin:
- m=re.match(r"\s*(private\s*key|public\s*key|password)\s*:\s*(\S+)\s*$",line,re.I)
- if m:d[m.group(1).lower().replace(" ","")]=m.group(2)
+ m=re.match(r"\s*(private\s*key|public\s*key|password(?:\s*\(\s*public\s*key\s*\))?)\s*:\s*(\S+)\s*$",line,re.I)
+ if m:
+  label=re.sub(r"\s+","",m.group(1).lower())
+  d["privatekey" if label=="privatekey" else "publickey"]=m.group(2)
 print(d.get("privatekey",""))
 print(d.get("publickey",d.get("password","")))
 ')
@@ -236,7 +401,7 @@ PY
 if [[ -n "$TLS_PORT" ]]; then write_payload tls "$TLS_PORT" "$TLS_UUID" "$PAYLOAD_DIR/tls.json"; fi
 if [[ -n "$REALITY_PORT" ]]; then write_payload reality "$REALITY_PORT" "$REALITY_UUID" "$PAYLOAD_DIR/reality.json"; fi
 
-# Create the polished static catalog and its local-only demo login flow.
+if (( NEW_SITE )); then
 mkdir -p "$SITE$ASSET_ROUTE"
 cp "$ASSET_DIR/poster-orbit.webp" "$SITE$ASSET_ROUTE/$ORBIT_FILE"
 cp "$ASSET_DIR/poster-noir.webp" "$SITE$ASSET_ROUTE/$NOIR_FILE"
@@ -285,8 +450,65 @@ page=page.replace("BRAND",brand).replace("ASSET_ROUTE",route).replace("ORBIT_IMA
 open(sys.argv[1],"w",encoding="utf-8").write(page)
 PY
 chmod 644 "$SITE/index.html"
+fi
 
-# Snapshot any nginx files this installer must touch, and install a restoration-based remover.
+if (( NEW_SITE )); then
+  CERT="/etc/letsencrypt/live/$DOMAIN/fullchain.pem"
+  KEY="/etc/letsencrypt/live/$DOMAIN/privkey.pem"
+  if [[ ! -r "$CERT" || ! -r "$KEY" ]]; then
+    if [[ -e "$CERT" || -e "$KEY" ]]; then die "A partial or unreadable certificate already exists for $DOMAIN; refusing to replace it."; fi
+    command -v certbot >/dev/null 2>&1 || {
+      command -v apt-get >/dev/null 2>&1 || die "certbot is missing and apt-get is unavailable."
+      export DEBIAN_FRONTEND=noninteractive
+      apt-get update
+      apt-get install -y --no-install-recommends certbot
+    }
+    read -rp 'Email for the new site certificate: ' CERT_EMAIL
+    [[ -n "$CERT_EMAIL" ]] || die "A contact email is required for the HTTPS certificate."
+    cat > "$NGINX_VHOST" <<EOF
+server {
+    listen 80;
+    server_name $DOMAIN;
+    root $SITE;
+    location ^~ /.well-known/acme-challenge/ { try_files \$uri =404; }
+    location / { try_files \$uri \$uri/ =404; }
+}
+EOF
+    NGINX_CHANGED=1
+    nginx_apply
+    certbot certonly --webroot --webroot-path "$SITE" --non-interactive --agree-tos -m "$CERT_EMAIL" -d "$DOMAIN"
+    [[ -r "$CERT" && -r "$KEY" ]] || die "Let's Encrypt did not create the expected certificate."
+  else
+    openssl x509 -in "$CERT" -noout -checkhost "$DOMAIN" >/dev/null 2>&1 || die "The existing certificate does not cover $DOMAIN."
+    openssl x509 -in "$CERT" -noout -checkend 0 >/dev/null 2>&1 || die "The existing certificate is expired."
+  fi
+  cat > "$NGINX_VHOST" <<EOF
+server {
+    listen 80;
+    server_name $DOMAIN;
+    root $SITE;
+    location ^~ /.well-known/acme-challenge/ { try_files \$uri =404; }
+    location / { return 301 https://\$host\$request_uri; }
+}
+server {
+    listen 443 ssl http2;
+    server_name $DOMAIN;
+    root $SITE;
+    index index.html;
+    ssl_certificate $CERT;
+    ssl_certificate_key $KEY;
+    ssl_protocols TLSv1.2 TLSv1.3;
+}
+EOF
+  NGINX_CHANGED=1
+  log "New HTTPS catalog site prepared; the XHTTP route will be added after preflight."
+fi
+if [[ "$MODE" == tls || "$MODE" == both ]]; then
+  python3 "$NGINX_HELPER" http2 "$NGINX_VHOST" "$DOMAIN" || die "The HTTPS site must enable HTTP/2 on IPv4 :443 for XHTTP TLS; no inbound was added."
+fi
+
+if false; then
+# Retired standalone-site implementation retained for reference only.
 NGINX_ORIG_HASH="$(sha256sum "$NGINX_CONF" | awk '{print $1}')"
 if [[ "$MODE" == reality || "$MODE" == both ]]; then
   if ! nginx -V 2>&1 | grep -Eq -- '--with-stream|stream=dynamic'; then
@@ -305,8 +527,8 @@ CERT="/etc/letsencrypt/live/$DOMAIN/fullchain.pem"
 KEY="/etc/letsencrypt/live/$DOMAIN/privkey.pem"
 # Refuse to steal :443 from an existing nginx site: Reality mode needs nginx
 # stream to own the public socket and pass ordinary HTTPS to its private origin port.
-if nginx -T 2>/dev/null | grep -Eq '^[[:space:]]*listen[[:space:]]+([^;[:space:]]*:)?443([[:space:];]|$)'; then
-  die "An nginx vhost already listens on :443. Back it up/move it first; Reality SNI routing needs exclusive ownership of this port."
+if [[ "$MODE" == reality || "$MODE" == both ]] && nginx -T 2>/dev/null | grep -Eq '^[[:space:]]*listen[[:space:]]+([^;[:space:]]*:)?443([[:space:];]|$)'; then
+  die "Reality/both needs nginx stream to own :443, but an nginx HTTPS vhost already listens there. Do not remove it blindly; resolve that listener conflict first."
 fi
 if nginx -T 2>/dev/null | grep -Eq "^[[:space:]]*server_name[[:space:]][^;]*([[:space:]])${DOMAIN//./\\.}([[:space:];])"; then
   die "An nginx vhost already claims $DOMAIN. Resolve that conflict before installing."
@@ -336,7 +558,7 @@ if [[ "$MODE" == reality || "$MODE" == both ]]; then
   mkdir -p /etc/nginx/streams-enabled
   if ! grep -q 'streams-enabled/\*.conf' "$NGINX_CONF"; then
     cp -a "$NGINX_CONF" "$BACKUP/nginx.conf.before-stream"
-    sed -i '/^events[[:space:]]*{/i stream { include /etc/nginx/streams-enabled/*.conf; }' "$NGINX_CONF"
+    sed -i '/^[[:space:]]*events[[:space:]]*{/i stream { include /etc/nginx/streams-enabled/*.conf; }' "$NGINX_CONF"
   fi
   cat > "$STREAM_CONF" <<EOF
 map \$ssl_preread_server_name \$stream_one_upstream {
@@ -396,6 +618,57 @@ cat >> "$VHOST" <<'EOF'
     location / { try_files $uri $uri/ =404; }
 }
 EOF
+fi
+
+# The additive installer preserves the existing HTTPS site and attaches only
+# one random XHTTP location; Reality uses a separate free TCP port.
+if [[ -n "$TLS_PORT" ]]; then
+  mkdir -p "$LOCATION_DIR"
+  cat > "$LOCATION_CONF" <<EOF
+location ^~ $PATH_XHTTP {
+    grpc_read_timeout 1h;
+    grpc_send_timeout 1h;
+    client_body_timeout 1h;
+    client_max_body_size 0;
+    grpc_set_header Host \\$host;
+    grpc_set_header X-Real-IP \\$remote_addr;
+    grpc_set_header X-Forwarded-For \\$proxy_add_x_forwarded_for;
+    grpc_pass grpc://127.0.0.1:$TLS_PORT;
+}
+EOF
+  NGINX_CHANGED=1
+  python3 "$NGINX_HELPER" add "$NGINX_VHOST" "$DOMAIN" "$LOCATION_INCLUDE" || die "Could not add the XHTTP route; existing site was preserved."
+fi
+if [[ "$MODE" == reality || "$MODE" == both ]]; then
+  [[ -n "$REALITY_EDGE_PORT" ]] || die "No free public port in 8443-8499; existing site was not changed."
+  if ! nginx -V 2>&1 | grep -Eq -- '--with-stream|stream=dynamic'; then
+    command -v apt-get >/dev/null 2>&1 || die "nginx stream module is unavailable."
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update
+    apt-get install -y libnginx-mod-stream
+  fi
+  if nginx -T 2>/dev/null | grep -Eq '^[[:space:]]*stream[[:space:]]*\{' \
+      && ! grep -q 'streams-enabled/\*.conf' "$NGINX_CONF"; then
+    die "nginx has an unmanaged stream{} block; refusing to alter it. Existing site and inbounds are preserved."
+  fi
+  mkdir -p /etc/nginx/streams-enabled
+  if ! grep -q 'streams-enabled/\*.conf' "$NGINX_CONF"; then
+    cp -a "$NGINX_CONF" "$BACKUP/nginx.conf.before-stream"
+    NGINX_BLOCK_ADDED=1
+    NGINX_CHANGED=1
+    sed -i '/^events[[:space:]]*{/i stream { include /etc/nginx/streams-enabled/*.conf; }' "$NGINX_CONF"
+    grep -Fq 'stream { include /etc/nginx/streams-enabled/*.conf; }' "$NGINX_CONF" || die "Could not add the managed nginx stream include; no existing configuration was overwritten."
+  fi
+  cat > "$STREAM_CONF" <<EOF
+server {
+    listen $REALITY_EDGE_PORT;
+    proxy_connect_timeout 5s;
+    proxy_timeout 1h;
+    proxy_pass 127.0.0.1:$REALITY_PORT;
+}
+EOF
+  NGINX_CHANGED=1
+fi
 
 # Validate generated Xray objects before calling the panel.
 for mode in tls reality; do
@@ -414,7 +687,7 @@ done
 nginx -t
 
 # Add and verify each selected inbound. Failure handler removes any created IDs.
-nginx -t && systemctl reload nginx
+nginx_apply
 for mode in tls reality; do
   [[ -f "$PAYLOAD_DIR/$mode.json" ]] || continue
   id="$(python3 "$HELPER" add "$BASE" "$PAYLOAD_DIR/$mode.json" "$AUTH")"
@@ -429,23 +702,23 @@ for port in "$TLS_PORT" "$REALITY_PORT"; do
   ss -H -ltn "sport = :$port" | grep -q "127.0.0.1:$port" || die "Xray did not listen on loopback port $port."
 done
 "$XRAY" run -test -config "$XRAY_CONFIG" >/dev/null || die "Panel's generated Xray config failed validation."
-nginx -t && systemctl reload nginx
+nginx_apply
 
 # Export client URI(s); secrets are stored in a root-only result directory.
-python3 - "$RESULT" "$MODE" "$DOMAIN" "$PATH_XHTTP" "$ASSET_ROUTE" "$TLS_UUID" "$REALITY_UUID" "$TLS_PORT" "$REALITY_PORT" "$TLS_ID" "$REALITY_ID" "$VLESS_ENC" "$REALITY_SNI" "$REALITY_PUBLIC" "$SID" "$SITE_NAME" <<'PY'
+python3 - "$RESULT" "$MODE" "$DOMAIN" "$PATH_XHTTP" "$TLS_UUID" "$REALITY_UUID" "$TLS_PORT" "$REALITY_PORT" "$TLS_EDGE_PORT" "$REALITY_EDGE_PORT" "$TLS_ID" "$REALITY_ID" "$VLESS_ENC" "$REALITY_SNI" "$REALITY_PUBLIC" "$SID" "$SITE_NAME" "$NEW_SITE" <<'PY'
 import json,pathlib,sys,urllib.parse
-o=pathlib.Path(sys.argv[1]);(mode,domain,path,asset_route,tu,ru,tp,rp,ti,ri,enc,sni,pub,sid,title)=sys.argv[2:]
-def write(name,uuid,security,extra):
+o=pathlib.Path(sys.argv[1]);(mode,domain,path,tu,ru,tp,rp,tpub,rpub,ti,ri,enc,sni,pub,sid,title,newsite)=sys.argv[2:]
+def write(name,uuid,security,extra,port):
  q={"encryption":enc,"flow":"xtls-rprx-vision","security":security,"type":"xhttp","host":domain,"path":path,"mode":"stream-one","fp":"chrome","alpn":"h2"}
  if security=="tls":q["sni"]=domain
  else:q.update({"sni":sni,"pbk":pub,"sid":sid})
  q["extra"]=json.dumps(extra,separators=(",",":"))
- link=f"vless://{uuid}@{domain}:443?"+urllib.parse.urlencode(q,quote_via=urllib.parse.quote)+"#"+urllib.parse.quote(title+" stream-one "+security)
+ link=f"vless://{uuid}@{domain}:{port}?"+urllib.parse.urlencode(q,quote_via=urllib.parse.quote)+"#"+urllib.parse.quote(title+" stream-one "+security)
  (o/f"vless-{security}.txt").write_text(link+"\n")
 settings={"mode":"stream-one","path":path,"host":domain,"xPaddingBytes":"128-1120","xPaddingObfsMode":True,"xPaddingKey":"X-Amz-Meta-Trace","xPaddingHeader":"X-Amz-Security-Token","xPaddingPlacement":"header","xPaddingMethod":"tokenish","sessionIDPlacement":"header","sessionIDKey":"x-amz-cf-id","sessionIDTable":"Base62","sessionIDLength":"16-32","seqPlacement":"header","seqKey":"x-amz-cf-pop","uplinkHTTPMethod":"POST","scMaxBufferedPosts":30,"scStreamUpServerSecs":"20-80","xmux":{"maxConcurrency":"0","maxConnections":"1-3","cMaxReuseTimes":"300-600","hMaxRequestTimes":"1000-2000","hMaxReusableSecs":"1200-2400","hKeepAlivePeriod":600},"enableXmux":True}
-if mode in ("tls","both"):write("tls",tu,"tls",settings)
-if mode in ("reality","both"):write("reality",ru,"reality",settings)
-(o/"deployment.json").write_text(json.dumps({"mode":mode,"domain":domain,"xhttpPath":path,"catalogAssetPath":asset_route,"tlsInboundId":int(ti) if ti else None,"realityInboundId":int(ri) if ri else None,"realitySni":sni or None,"tlsPort":int(tp) if tp else None,"realityPort":int(rp) if rp else None,"panelPatch":"xhttp-vlessenc-vision-2811-v4/v5"},indent=2))
+if mode in ("tls","both"):write("tls",tu,"tls",settings,tpub)
+if mode in ("reality","both"):write("reality",ru,"reality",settings,rpub)
+(o/"deployment.json").write_text(json.dumps({"mode":mode,"domain":domain,"siteMode":"new" if newsite=="1" else "existing","sitePreserved":newsite!="1","xhttpPath":path,"tlsInboundId":int(ti) if ti else None,"realityInboundId":int(ri) if ri else None,"realitySni":sni or None,"tlsPort":int(tp) if tp else None,"realityPort":int(rp) if rp else None,"tlsPublicPort":int(tpub) if tp and tpub else None,"realityPublicPort":int(rpub) if rp and rpub else None,"panelPatch":"xhttp-vlessenc-vision-2811-v4/v5"},indent=2))
 PY
 chmod 600 "$RESULT"/*
 cat > "$RESULT/remove.sh" <<EOF
@@ -459,34 +732,48 @@ EOF
 for id in "$TLS_ID" "$REALITY_ID"; do
   [[ -n "$id" ]] && printf "python3 '%s/xui-api.py' del '%s' '%s' '$RESULT/auth'\n" "$RESULT" "$BASE" "$id" >> "$RESULT/remove.sh"
 done
-# The remover owns only files created by this deployment; certbot material is retained.
+# The remover owns only files and inbounds created by this deployment.
 cat >> "$RESULT/remove.sh" <<EOF
 python3 '$RESULT/xui-api.py' restart '$BASE' '$RESULT/auth'
-rm -f '$VHOST' '$STREAM_CONF'
-if [[ -f '$BACKUP/nginx.conf.before-stream' ]]; then
+rm -f '$LOCATION_CONF' '$STREAM_CONF'
+python3 '$RESULT/nginx-vhost.py' remove '$NGINX_VHOST' '$LOCATION_INCLUDE'
+EOF
+if (( NEW_SITE )); then
+  cat >> "$RESULT/remove.sh" <<EOF
+rm -f '$NGINX_VHOST'
+rm -rf --one-file-system '$SITE'
+EOF
+fi
+if (( NGINX_BLOCK_ADDED )); then
+  cat >> "$RESULT/remove.sh" <<EOF
+if ! compgen -G '/etc/nginx/streams-enabled/*.conf' >/dev/null; then
   python3 - '$NGINX_CONF' <<'PY'
 import pathlib,sys
-p=pathlib.Path(sys.argv[1]); lines=p.read_text().splitlines(keepends=True)
-for i,line in enumerate(lines):
-    if line.strip() == 'stream { include /etc/nginx/streams-enabled/*.conf; }':
-        del lines[i]
-        break
-p.write_text(''.join(lines))
+p=pathlib.Path(sys.argv[1]); line='stream { include /etc/nginx/streams-enabled/*.conf; }'
+if p.exists():
+    lines=p.read_text().splitlines(keepends=True)
+    kept=[x for x in lines if x.strip()!=line]
+    if len(kept)!=len(lines): p.write_text(''.join(kept))
 PY
 fi
-rm -rf --one-file-system '$SITE'
-nginx -t && systemctl reload nginx
-rm -f '$RESULT/auth'
-echo 'Selected inbounds, nginx routes and site removed; certificates and backups retained.'
 EOF
-cp "$HELPER" "$RESULT/xui-api.py"; chmod 700 "$RESULT/xui-api.py"; chmod 700 "$RESULT/remove.sh"
-rm -f "$HELPER" "$AUTH" "$PAYLOAD_DIR"/* /tmp/xray-"$DEPLOY"-*.json
+fi
+cat >> "$RESULT/remove.sh" <<EOF
+rmdir '$LOCATION_DIR' 2>/dev/null || true
+nginx -t && { systemctl reload nginx || systemctl start nginx; }
+rm -f '$RESULT/auth'
+echo 'Added inbound(s) and route removed; unrelated sites, certificates and inbounds were preserved.'
+EOF
+cp "$HELPER" "$RESULT/xui-api.py"
+cp "$NGINX_HELPER" "$RESULT/nginx-vhost.py"
+chmod 700 "$RESULT/xui-api.py" "$RESULT/nginx-vhost.py" "$RESULT/remove.sh"
+rm -f "$HELPER" "$NGINX_HELPER" "$AUTH" "$PAYLOAD_DIR"/* /tmp/xray-"$DEPLOY"-*.json
 COMMITTED=1
 trap - EXIT
 log "Installed mode: $MODE"
-log "Site: https://$DOMAIN/"
-[[ -n "$TLS_PORT" ]] && log "TLS inbound: 127.0.0.1:$TLS_PORT, panel ID $TLS_ID; link: $RESULT/vless-tls.txt"
-[[ -n "$REALITY_PORT" ]] && log "Reality inbound: 127.0.0.1:$REALITY_PORT, panel ID $REALITY_ID; SNI $REALITY_SNI; link: $RESULT/vless-reality.txt"
-log "Random XHTTP path: $PATH_XHTTP; catalog art path: $ASSET_ROUTE/"
-log "Remove script: $RESULT/remove.sh"
+if (( NEW_SITE )); then log "New catalog site: https://$DOMAIN/"; else log "Existing site preserved: https://$DOMAIN/"; fi
+[[ -n "$TLS_PORT" ]] && log "TLS inbound: 127.0.0.1:$TLS_PORT, public :$TLS_EDGE_PORT, panel ID $TLS_ID; link: $RESULT/vless-tls.txt"
+[[ -n "$REALITY_PORT" ]] && log "Reality inbound: 127.0.0.1:$REALITY_PORT, public :$REALITY_EDGE_PORT, panel ID $REALITY_ID; SNI $REALITY_SNI; link: $RESULT/vless-reality.txt"
+log "Random XHTTP path: $PATH_XHTTP"
+log "Cleanup script (removes only components created by this run): $RESULT/remove.sh"
 log "Backup: $BACKUP"

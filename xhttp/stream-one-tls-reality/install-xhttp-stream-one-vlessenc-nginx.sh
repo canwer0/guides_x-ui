@@ -229,6 +229,8 @@ if [[ "$VHOST" == '__NONE__' ]]; then
   CERT="/etc/letsencrypt/live/$DOMAIN/fullchain.pem"
   KEY="/etc/letsencrypt/live/$DOMAIN/privkey.pem"
   mkdir -p "$SITE/posters"
+  # Nginx runs as an unprivileged user; umask 077 must not hide the webroot.
+  chmod 755 "$SITE" "$SITE/posters"
   for image in poster-orbit.webp poster-noir.webp poster-summit.webp poster-afterglow.webp; do cp "$ASSET_DIR/$image" "$SITE/posters/$image"; done
   chmod 644 "$SITE/posters/"*.webp
   python3 - "$SITE/index.html" "$SITE_NAME" <<'PY'
@@ -253,7 +255,16 @@ PY
 server { listen 80; server_name $DOMAIN; root $SITE; location ^~ /.well-known/acme-challenge/ { try_files \$uri =404; } location / { try_files \$uri \$uri/ =404; } }
 EOF
     nginx_apply || die 'Nginx rejected the temporary certificate vhost.'
-    certbot certonly --webroot --webroot-path "$SITE" --non-interactive --agree-tos -m "$CERT_EMAIL" -d "$DOMAIN"
+    mkdir -p "$SITE/.well-known/acme-challenge"
+    chmod 755 "$SITE/.well-known" "$SITE/.well-known/acme-challenge"
+    probe="acme-probe-$(openssl rand -hex 8)"
+    printf '%s\n' "$probe" > "$SITE/.well-known/acme-challenge/$probe"
+    chmod 644 "$SITE/.well-known/acme-challenge/$probe"
+    curl --noproxy '*' -fsS --resolve "$DOMAIN:80:127.0.0.1" \
+      "http://$DOMAIN/.well-known/acme-challenge/$probe" | grep -Fxq "$probe" \
+      || die 'Nginx cannot serve ACME challenge files from the new site.'
+    rm -f -- "$SITE/.well-known/acme-challenge/$probe"
+    (umask 022; certbot certonly --webroot --webroot-path "$SITE" --non-interactive --agree-tos -m "$CERT_EMAIL" -d "$DOMAIN")
     [[ -r "$CERT" && -r "$KEY" ]] || die 'Certificate issuance failed.'
   fi
   openssl x509 -in "$CERT" -noout -checkhost "$DOMAIN" >/dev/null 2>&1 || die 'Certificate does not cover the site domain.'

@@ -260,9 +260,14 @@ EOF
     probe="acme-probe-$(openssl rand -hex 8)"
     printf '%s\n' "$probe" > "$SITE/.well-known/acme-challenge/$probe"
     chmod 644 "$SITE/.well-known/acme-challenge/$probe"
-    curl --noproxy '*' -fsS --resolve "$DOMAIN:80:127.0.0.1" \
-      "http://$DOMAIN/.well-known/acme-challenge/$probe" | grep -Fxq "$probe" \
-      || die 'Nginx cannot serve ACME challenge files from the new site.'
+    probe_ready=0
+    for _ in $(seq 1 40); do
+      response="$(curl --noproxy '*' -fsS --resolve "$DOMAIN:80:127.0.0.1" \
+        "http://$DOMAIN/.well-known/acme-challenge/$probe" 2>/dev/null)" || response=''
+      if [[ "$response" == "$probe" ]]; then probe_ready=1; break; fi
+      sleep .25
+    done
+    ((probe_ready)) || die 'Nginx still cannot serve ACME challenge files after reload; check its error log.'
     rm -f -- "$SITE/.well-known/acme-challenge/$probe"
     (umask 022; certbot certonly --webroot --webroot-path "$SITE" --non-interactive --agree-tos -m "$CERT_EMAIL" -d "$DOMAIN")
     [[ -r "$CERT" && -r "$KEY" ]] || die 'Certificate issuance failed.'

@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+.env
+.env.*
+!*.example
+client-*.json
+vless-*.txt
+deployment.json
+*.db
+*.db-wal
+*.db-shm
+*.pem
+*.key
+backups/

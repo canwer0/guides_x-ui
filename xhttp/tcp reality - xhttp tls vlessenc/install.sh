@@ -250,12 +250,19 @@ class Deployment:
         self.oldrows={}
         self.users=conn.execute('select id from users order by id limit 1').fetchone()
         if not self.users:raise RuntimeError('No panel user found')
-        for kind,ident in self.ids.items():
+        for kind,ident in list(self.ids.items()):
             row=conn.execute('select * from inbounds where id=?',(ident,)).fetchone()
-            if not row:raise RuntimeError('Managed inbound ID is missing: '+str(ident))
+            if not row:
+                log('Previously managed '+kind+' inbound was removed; creating a replacement')
+                del self.ids[kind]
+                continue
             row=dict(row);stream=json.loads(row['stream_settings'])
             expected=stream.get('security')=='reality' if kind=='reality' else stream.get('network')=='xhttp'
-            if not expected or self.domain not in row['remark']:raise RuntimeError('Managed inbound differs from stored deployment')
+            if old.get('schema')==2:
+                domain_matches=self.domain in stream.get('realitySettings',{}).get('serverNames',[]) if kind=='reality' else stream.get('xhttpSettings',{}).get('host')==self.domain
+                owned_row=(row['listen']==old[kind]['listen'] and row['port']==old[kind]['internalPort'] and domain_matches)
+            else:owned_row=self.domain in row['remark']
+            if not expected or not owned_row:raise RuntimeError('Stored inbound ID belongs to a different configuration: '+str(ident))
             self.oldrows[kind]=row
         self.excluded.update(r[0] for r in conn.execute('select port from inbounds'));conn.close()
         owned={str(p.resolve()) for p in self.oldfiles}|{str(self.http),str(self.stream)}

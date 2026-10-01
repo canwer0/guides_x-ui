@@ -293,7 +293,7 @@ server {{
         grpc_socket_keepalive on;
         grpc_set_header Host $host;
         grpc_set_header X-Real-IP $remote_addr;
-        grpc_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        grpc_set_header X-Forwarded-For "";
         grpc_set_header X-Forwarded-Proto https;
         grpc_pass grpc://127.0.0.1:{self.xport};
         access_log off;

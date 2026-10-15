@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# Ограничивает доступ к порту панели 3x-ui одним доверенным IPv4.
+# Ограничивает доступ к порту панели 3x-ui доверенными IPv4.
 # Для Debian/Ubuntu с systemd и iptables.
 
 readonly CHAIN4="XUI_PANEL_GUARD"
@@ -195,22 +195,48 @@ valid_ipv4 "${ssh_ip:-}" || ssh_ip=""
 while :; do
     if [[ -n "${ssh_ip}" ]]; then
         read -r -p \
-            "Разрешённый IPv4 [IP основного входа: ${ssh_ip}]: " \
-            trusted_ip
+            "Разрешённые IPv4 через пробел [IP основного входа: ${ssh_ip}]: " \
+            trusted_input
 
-        trusted_ip="${trusted_ip:-${ssh_ip}}"
+        [[ -n "${trusted_input//[[:space:]]/}" ]] || trusted_input="${ssh_ip}"
     else
-        read -r -p "Введи разрешённый публичный IPv4: " trusted_ip
+        read -r -p "Введи разрешённые публичные IPv4 через пробел: " trusted_input
     fi
 
-    if ! valid_ipv4 "${trusted_ip}"; then
-        say "Некорректный IPv4. Попробуй ещё раз."
+    trusted_ips=()
+    read -r -a entered_ips <<< "${trusted_input}"
+    invalid_ip=false
+    for trusted_ip in "${entered_ips[@]}"; do
+        if ! valid_ipv4 "${trusted_ip}"; then
+            say "Некорректный IPv4: ${trusted_ip}. Попробуй ещё раз."
+            invalid_ip=true
+            break
+        fi
+        # Нормализуем октеты и убираем повторяющиеся адреса.
+        IFS=. read -r a b c d <<< "${trusted_ip}"
+        printf -v trusted_ip '%d.%d.%d.%d' "$((10#$a))" "$((10#$b))" "$((10#$c))" "$((10#$d))"
+        duplicate=false
+        for existing_ip in "${trusted_ips[@]}"; do
+            if [[ "${existing_ip}" == "${trusted_ip}" ]]; then
+                duplicate=true
+                break
+            fi
+        done
+        if ! "${duplicate}"; then
+            trusted_ips+=("${trusted_ip}")
+        fi
+    done
+    if "${invalid_ip}"; then
+        continue
+    fi
+    if ((${#trusted_ips[@]} == 0)); then
+        say "Укажи хотя бы один IPv4."
         continue
     fi
 
     say ""
     say "Порт панели:       ${panel_port}/tcp"
-    say "Разрешённый адрес: ${trusted_ip}/32"
+    say "Разрешённые адреса: ${trusted_ips[*]}"
     say "Остальные IPv4 и удалённые IPv6 будут заблокированы."
     say ""
 
@@ -221,7 +247,7 @@ while :; do
             break
             ;;
         n|N|no|NO|No|н|Н|нет|НЕТ)
-            say "Введи адрес повторно."
+            say "Введи адреса повторно."
             ssh_ip=""
             ;;
         *)
@@ -256,7 +282,9 @@ remove_guard
 # Правила IPv4.
 iptables -N "${CHAIN4}"
 iptables -A "${CHAIN4}" -s 127.0.0.0/8 -j ACCEPT
-iptables -A "${CHAIN4}" -s "${trusted_ip}/32" -j ACCEPT
+for trusted_ip in "${trusted_ips[@]}"; do
+    iptables -A "${CHAIN4}" -s "${trusted_ip}/32" -j ACCEPT
+done
 iptables -A "${CHAIN4}" -j DROP
 
 iptables -I INPUT 1 \
@@ -285,7 +313,7 @@ mkdir -p "${STATE_DIR}"
 
 {
     printf 'PANEL_PORT=%q\n' "${panel_port}"
-    printf 'TRUSTED_IPV4=%q\n' "${trusted_ip}"
+    printf 'TRUSTED_IPV4=%q\n' "${trusted_ips[*]}"
 } > "${STATE_FILE}"
 
 chmod 0600 "${STATE_FILE}"
@@ -294,7 +322,7 @@ save_rules
 
 say ""
 say "Правило установлено и сохранено."
-say "Панель на порту ${panel_port} доступна только с ${trusted_ip}."
+say "Панель на порту ${panel_port} доступна только с: ${trusted_ips[*]}."
 say "SSH и остальные порты не изменялись."
 say ""
 say "Удаление ограничения:"

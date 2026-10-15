@@ -1,4 +1,4 @@
-# 🛠 guides_x-ui
+🛠 guides_x-ui
 
 Набор скриптов и быстрых команд для настройки и обслуживания **3X-UI / Xray**.
 
@@ -15,7 +15,6 @@ bash <(curl -fsSL https://raw.githubusercontent.com/canwer0/guides_x-ui/main/war
 ---
 
 ---
-
 ## 🚨 Zabbix-agent
 
 Устанавливает zabbix-agent для мониторинга.
@@ -35,7 +34,6 @@ bash <(curl -fsSL https://raw.githubusercontent.com/canwer0/guides_x-ui/main/zab
 ```
 
 ---
-
 ## 🔄 Автоматический перезапуск Xray Core
 
 Устанавливает автоматический перезапуск Xray Core каждые 70 минут без перезапуска панели 3X-UI.
@@ -45,7 +43,6 @@ curl -fsSL https://raw.githubusercontent.com/canwer0/guides_x-ui/main/cron-scrip
 ```
 
 ---
-
 ## 🚀 XHTTP patch для 3X-UI 2.8.11
 
 Шаг1. Устанавливает XHTTP patch для **3X-UI 2.8.11**.
@@ -59,7 +56,6 @@ bash -n /tmp/patch-xhttp-2.8.11.sh &&
 sudo bash /tmp/patch-xhttp-2.8.11.sh
 ```
 Шаг2. Разворачивает фейк сайт и настраивает nginx
-
 ```bash
 curl -fsSL \
 "https://raw.githubusercontent.com/canwer0/guides_x-ui/main/xhttp/next_installation_step.sh?v=$(date +%s)" \
@@ -70,4 +66,29 @@ sudo bash /tmp/next_installation_step.sh
 ```
 ---
 
-> Скрипты предназначены для быстрого развёртывания и настройки компонентов 3X-UI.
+## 🔒 Доступ к панели только со своего IP
+
+Ограничивает доступ к порту панели одним IPv4 и сохраняет правила firewall после перезагрузки.
+
+```bash
+sudo apt-get update && sudo apt-get install -y iptables
+curl -fsSL https://raw.githubusercontent.com/canwer0/guides_x-ui/main/restrict-xui-panel-ip.sh -o /tmp/restrict-xui-panel-ip.sh
+sudo bash /tmp/restrict-xui-panel-ip.sh
+```
+
+---
+
+## 🌐 TCP REALITY + XHTTP TLS VLESSENC
+
+Разворачивает сайт и два VLESS-подключения на общем порту **443**.
+
+Нужны домен, открытые TCP **80/443**, **3X-UI 2.8.11 с патчем v5** и совместимый Xray — проверено на **26.7.11**.
+
+```bash
+curl -fsSL \
+  "https://raw.githubusercontent.com/canwer0/guides_x-ui/main/xhttp/tcp%20reality%20-%20xhttp%20tls%20vlessenc/install.sh" \
+  -o /tmp/install-xhttp-reality.sh
+
+bash -n /tmp/install-xhttp-reality.sh &&
+sudo bash /tmp/install-xhttp-reality.sh
+```

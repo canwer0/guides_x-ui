@@ -366,6 +366,7 @@ server {{
     ssl_certificate_key {self.certkey};
     ssl_protocols TLSv1.2 TLSv1.3;
     server_tokens off;
+    add_header Strict-Transport-Security "max-age=31536000" always;
     add_header X-Content-Type-Options nosniff always;
     add_header Referrer-Policy strict-origin-when-cross-origin always;
     location ^~ {self.path} {{

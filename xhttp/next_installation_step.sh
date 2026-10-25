@@ -2,9 +2,13 @@
 set -Eeuo pipefail
 umask 077
 
-# Creates a separate optimized VLESS/XHTTP packet-up inbound in 3x-ui, an nginx origin
+# Creates a separate VLESS/XHTTP packet-up inbound in 3x-ui, an nginx origin
 # protected with X-CDN-Origin-Secret, and a harmless movie-catalog decoy site.
 # Intended for Ubuntu hosts where nginx and 3x-ui/Xray are already installed.
+# Uses the agreed GET/body profile: 3,000,000 bytes, server queue 100, XMUX concurrency 1.
+# Existing inbounds and routing are not edited. The panel-patch prerequisite stays intact.
+# Requires an Xray build that supports these XHTTP fields; no core is patched here.
+# This profile does not establish that CDN stalls or Happ/iOS issues are resolved.
 
 XRAY_BIN="/usr/local/x-ui/bin/xray-linux-amd64"
 XRAY_CONFIG="/usr/local/x-ui/bin/config.json"
@@ -63,6 +67,13 @@ systemctl enable --now nginx
 systemctl is-active --quiet x-ui || die "x-ui is not active"
 nginx -t >/dev/null
 
+# This installer retains its original public nginx:443 layout. Do not displace an
+# existing Xray/Reality listener or silently leave a vhost that cannot bind.
+HTTPS_LISTENERS=$(ss -H -ltnp "sport = :443")
+if [[ -n "$HTTPS_LISTENERS" ]] && grep -v '"nginx"' <<<"$HTTPS_LISTENERS" | grep -q .; then
+    die "TCP port 443 is already used by a non-nginx service. This installer needs nginx on 443; it will not replace an existing Xray/Reality frontend."
+fi
+
 read -rp 'Origin domain (for example example.com): ' ORIGIN_DOMAIN
 ORIGIN_DOMAIN=${ORIGIN_DOMAIN,,}
 [[ "$ORIGIN_DOMAIN" =~ ^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$ ]] || die "Invalid origin domain"
@@ -103,7 +114,7 @@ read -rp '3x-ui password: ' XUI_PASS
 [[ -n "$XUI_USER" && -n "$XUI_PASS" ]] || die "3x-ui credentials are required"
 
 DEPLOY_ID=$(openssl rand -hex 6)
-PUBLIC_PATH="/assets-$(openssl rand -hex 12).css"
+PUBLIC_PATH="/static/getFile/video/segment-$(openssl rand -hex 12).ts"
 INTERNAL_PATH="/cdnapi-$(openssl rand -hex 12).txt"
 BOT_EXTERNAL_REMARK="bot:{\"path\":\"${PUBLIC_PATH}\",\"host\":\"${CDN_DOMAIN}\"}"
 CLIENT_UUID=$(cat /proc/sys/kernel/random/uuid)
@@ -182,44 +193,34 @@ else:
     raise SystemExit("Unknown action")
 PY
 
-python3 - "$PAYLOAD" "$INBOUND_PORT" "$CLIENT_UUID" "$INTERNAL_PATH" "$INBOUND_TAG" "$REMARK" "$CDN_DOMAIN" "$BOT_EXTERNAL_REMARK" <<'PY'
+python3 - "$PAYLOAD" "$INBOUND_PORT" "$CLIENT_UUID" "$INTERNAL_PATH" "$INBOUND_TAG" "$REMARK" "$CDN_DOMAIN" "$BOT_EXTERNAL_REMARK" "$RESULT_DIR/client-extra.json" <<'PY'
 import json, sys
-out, port, uuid, path, tag, remark, cdn_domain, external_remark = sys.argv[1:]
-xhttp = {
-    "headers": {"User-Agent": "golang"},
-    "host": "",
-    "mode": "packet-up",
-    "path": path,
-    "serverMaxHeaderBytes": 32768,
-    "scMaxEachPostBytes": "1048576",
-    "scMinPostsIntervalMs": "10-20",
-    "scMaxBufferedPosts": 30,
-    "scStreamUpServerSecs": "20-80",
-    "uplinkDataPlacement": "body",
-    "uplinkHTTPMethod": "GET",
-    "sessionIDPlacement": "query",
-    "sessionIDKey": "auth",
-    "sessionIDTable": "Base62",
-    "sessionIDLength": "16-32",
-    "seqPlacement": "query",
+out, port, uuid, path, tag, remark, cdn_domain, external_remark, extra_out = sys.argv[1:]
+# One source of transport parameters for both the inbound and every client export.
+# Mirrors the supplied working example; do not restore the old fixed-connection pool.
+extra = {
+    "xmux": {"maxConcurrency": "1"},
     "seqKey": "chunk_id",
-    "xPaddingBytes": "50-150",
-    "xPaddingPlacement": "header",
-    "xPaddingKey": "X-Padding",
-    "xPaddingMethod": "tokenish",
-    "xPaddingObfsMode": True,
+    "sessionKey": "auth",
     "noSSEHeader": True,
     "noGRPCHeader": True,
-    "xmux": {
-        "maxConcurrency": "0",
-        "maxConnections": "2-4",
-        "cMaxReuseTimes": "1000",
-        "hMaxRequestTimes": "600-900",
-        "hMaxReusableSecs": "100",
-        "hKeepAlivePeriod": 20000,
-    },
-    "enableXmux": True,
+    "seqPlacement": "query",
+    "sessionIDKey": "auth",
+    "xPaddingBytes": "50-150",
+    "xPaddingMethod": "tokenish",
+    "sessionIDLength": "16-32",
+    "sessionPlacement": "query",
+    "uplinkHTTPMethod": "GET",
+    "xPaddingObfsMode": True,
+    "xPaddingPlacement": "header",
+    "scMaxBufferedPosts": 100,
+    "scMaxEachPostBytes": 3000000,
+    "sessionIDPlacement": "query",
+    "uplinkDataPlacement": "body",
+    "scMinPostsIntervalMs": "5-10",
+    "serverMaxHeaderBytes": 32768,
 }
+xhttp = {"mode": "packet-up", "path": path, "extra": extra}
 settings = {
     "clients": [{
         "id": uuid, "flow": "", "email": remark,
@@ -258,8 +259,26 @@ payload = {
 }
 with open(out, "w", encoding="utf-8") as handle:
     json.dump(payload, handle)
+with open(extra_out, "w", encoding="utf-8") as handle:
+    json.dump(extra, handle, indent=2)
+# Validate this new inbound without starting another Xray process or touching others.
+from pathlib import Path
+check_dir = Path(extra_out).parent
+core_stream = {key: value for key, value in stream.items() if key != "externalProxy"}
+core_inbound = {
+    "listen": "127.0.0.1", "port": int(port), "protocol": "vless", "tag": tag,
+    "settings": settings, "streamSettings": core_stream, "sniffing": sniffing,
+}
+(check_dir / "server-inbound.json").write_text(json.dumps(core_inbound, indent=2), encoding="utf-8")
+(check_dir / "xray-inbound-check.json").write_text(json.dumps({
+    "inbounds": [core_inbound], "outbounds": [{"protocol": "freedom", "tag": "direct"}],
+}, indent=2), encoding="utf-8")
 PY
 chmod 600 "$PAYLOAD"
+if ! "$XRAY_BIN" run -test -c "$RESULT_DIR/xray-inbound-check.json"; then
+    rm -f "$HELPER" "$PAYLOAD"
+    die "Installed Xray rejected the generated inbound; existing inbounds were not changed."
+fi
 
 mkdir -p "$SITE_DIR/static"
 chmod 755 "$SITE_DIR" "$SITE_DIR/static"
@@ -321,18 +340,29 @@ ORIGIN_SCHEME="https"
 ORIGIN_PORT="443"
 
 install -m 640 -o root -g www-data /dev/stdin "$NGINX_FILE" <<EOF
+# Send HSTS only over HTTPS; do not impose policy on other subdomains.
+map \$https \$cdn_hsts_${DEPLOY_ID} {
+    default "";
+    on "max-age=31536000";
+}
+
 server {
     listen 80;
     listen [::]:80;
 ${TLS_BLOCK}    server_name ${ORIGIN_DOMAIN};
+    ssl_protocols TLSv1.2 TLSv1.3;
     root ${SITE_DIR};
     index index.html;
 
     server_tokens off;
+    add_header Strict-Transport-Security \$cdn_hsts_${DEPLOY_ID} always;
     client_header_buffer_size 16k;
     large_client_header_buffers 16 32k;
 
     location = ${PUBLIC_PATH} {
+        access_log off;
+        client_max_body_size 4m;
+
         set \$xhttp_method_${DEPLOY_ID} \$request_method;
         if (\$request_method = OPTIONS) { set \$xhttp_method_${DEPLOY_ID} POST; }
         if (\$http_x_cdn_origin_secret != "${CDN_SECRET}") { return 403; }
@@ -343,8 +373,8 @@ ${TLS_BLOCK}    server_name ${ORIGIN_DOMAIN};
         proxy_pass_request_headers on;
         proxy_set_header Host \$host;
         proxy_set_header Connection "";
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Real-IP "";
+        proxy_set_header X-Forwarded-For "";
         proxy_set_header X-Forwarded-Proto https;
         proxy_set_header X-CDN-Origin-Secret "";
         proxy_request_buffering off;
@@ -356,6 +386,7 @@ ${TLS_BLOCK}    server_name ${ORIGIN_DOMAIN};
         proxy_send_timeout 3600s;
         add_header Cache-Control "no-store" always;
         add_header X-Accel-Buffering "no" always;
+        add_header Strict-Transport-Security \$cdn_hsts_${DEPLOY_ID} always;
     }
 
     location ~* \.css$ {
@@ -369,6 +400,7 @@ ${TLS_BLOCK}    server_name ${ORIGIN_DOMAIN};
     location / {
         try_files \$uri \$uri/ =404;
         add_header Cache-Control "no-cache";
+        add_header Strict-Transport-Security \$cdn_hsts_${DEPLOY_ID} always;
     }
 }
 EOF
@@ -416,46 +448,75 @@ python3 - "$RESULT_DIR" "$CDN_DOMAIN" "$PUBLIC_PATH" "$CLIENT_UUID" "$INBOUND_PO
 import json, pathlib, sys, urllib.parse
 out, domain, public_path, uuid, port, internal_path, inbound_id = sys.argv[1:]
 out = pathlib.Path(out)
-xhttp = {
-    "headers": {"User-Agent": "golang"},
-    "host": domain, "mode": "packet-up", "path": public_path,
-    "serverMaxHeaderBytes": 32768,
-    "scMaxEachPostBytes": "1048576", "scMinPostsIntervalMs": "10-20",
-    "scMaxBufferedPosts": 30,
-    "uplinkDataPlacement": "body", "uplinkHTTPMethod": "GET",
-    "sessionIDPlacement": "query", "sessionIDKey": "auth",
-    "sessionIDTable": "Base62", "sessionIDLength": "16-32",
-    "seqPlacement": "query", "seqKey": "chunk_id",
-    "xPaddingBytes": "50-150", "xPaddingPlacement": "header",
-    "xPaddingKey": "X-Padding", "xPaddingMethod": "tokenish",
-    "xPaddingObfsMode": True, "noSSEHeader": True, "noGRPCHeader": True,
-    "xmux": {"maxConcurrency": "0", "maxConnections": "2-4", "cMaxReuseTimes": "1000", "hMaxRequestTimes": "600-900", "hMaxReusableSecs": "100", "hKeepAlivePeriod": 20000},
-    "enableXmux": True,
-}
-extra = {key: value for key, value in xhttp.items() if key not in {"host", "path", "mode"}}
+extra = json.loads((out / "client-extra.json").read_text(encoding="utf-8"))
+xhttp = {"host": domain, "mode": "packet-up", "path": public_path, "extra": extra}
 query = {
     "encryption": "none", "security": "tls", "sni": domain,
-    "fp": "chrome", "alpn": "h2", "type": "xhttp",
+    "fp": "edge", "alpn": "h2,http/1.1", "type": "xhttp",
     "host": domain, "path": public_path, "mode": "packet-up",
     "extra": json.dumps(extra, separators=(",", ":")),
 }
 link = "vless://" + uuid + "@" + domain + ":443?" + urllib.parse.urlencode(
     query, quote_via=urllib.parse.quote
-) + "#" + urllib.parse.quote("CDN-XHTTP-fast")
+) + "#" + urllib.parse.quote("CDN-XHTTP-packet-up")
 (out / "client-xhttpSettings.json").write_text(json.dumps(xhttp, indent=2), encoding="utf-8")
-(out / "client-extra.json").write_text(json.dumps(extra, indent=2), encoding="utf-8")
 (out / "vless-link.txt").write_text(link + "\n", encoding="utf-8")
+profile = {
+    "remarks": "CDN-XHTTP-packet-up",
+    "log": {"access": "none", "dnsLog": False, "loglevel": "warning"},
+    "dns": {
+        "queryStrategy": "UseIPv4",
+        "servers": [{"address": "1.1.1.1", "skipFallback": False},
+                    {"address": "8.8.8.8", "skipFallback": False}],
+    },
+    "inbounds": [
+        {"tag": "socks", "listen": "127.0.0.1", "port": 10808, "protocol": "socks",
+         "settings": {"auth": "noauth", "udp": True},
+         "sniffing": {"enabled": True, "destOverride": ["http", "tls", "quic"], "routeOnly": True}},
+        {"tag": "http", "listen": "127.0.0.1", "port": 10809, "protocol": "http", "settings": {}},
+    ],
+    "outbounds": [
+        {"tag": "proxy", "protocol": "vless",
+         "settings": {"vnext": [{"address": domain, "port": 443,
+                                  "users": [{"id": uuid, "encryption": "none", "flow": ""}]}]},
+         "streamSettings": {"network": "xhttp", "security": "tls",
+                            "tlsSettings": {"serverName": domain, "fingerprint": "edge",
+                                            "alpn": ["h2", "http/1.1"], "enableSessionResumption": False},
+                            "xhttpSettings": xhttp}},
+        {"tag": "direct", "protocol": "freedom"},
+        {"tag": "blocked", "protocol": "blackhole", "settings": {}},
+    ],
+    "routing": {"domainStrategy": "AsIs", "rules": [
+        {"type": "field", "network": "tcp,udp", "outboundTag": "proxy"},
+    ]},
+}
+(out / "client-xray.json").write_text(json.dumps(profile, indent=2), encoding="utf-8")
+(out / "happ-client.json").write_text(json.dumps([profile], indent=2), encoding="utf-8")
+(out / "CLIENT-README.txt").write_text(
+    "Import the complete line from vless-link.txt to keep your existing Happ routing rules.\n"
+    "happ-client.json is a full JSON-array profile for Happ; client-xray.json is a single Xray config.\n"
+    "Full JSON routes all TCP/UDP through this VPN; normal Happ routing settings do not override it.\n"
+    "client-extra.json and client-xhttpSettings.json are fragments, not standalone VPN profiles.\n"
+    "The origin secret is server-side only and is not included in any client profile.\n"
+    "Server/client settings match the supplied example; iOS compatibility and long transfers still need testing.\n",
+    encoding="utf-8",
+)
 receipt = {
     "domain": domain, "publicPath": public_path, "internalPath": internal_path,
     "uuid": uuid, "inboundPort": int(port), "xuiInboundId": int(inbound_id),
-    "profile": "packet-up-xmux-optimized", "scMaxEachPostBytes": 1048576,
-    "scMaxBufferedPosts": 30, "xmuxMaxConnections": "2-4",
+    "profile": "packet-up-get-body-xmux1-3mb", "scMaxEachPostBytes": 3000000,
+    "scMaxBufferedPosts": 100, "xmuxMaxConcurrency": "1",
+    "scMinPostsIntervalMs": "5-10", "nginxClientMaxBodySize": "4m",
+    "tlsFingerprint": "edge", "tlsAlpn": ["h2", "http/1.1"],
+    "xrayClientFile": "client-xray.json", "happClientFile": "happ-client.json",
     "externalProxyRemark": "bot:" + json.dumps(
         {"path": public_path, "host": domain}, separators=(",", ":")
     ),
 }
 (out / "deployment.json").write_text(json.dumps(receipt, indent=2), encoding="utf-8")
 PY
+
+"$XRAY_BIN" run -test -c "$RESULT_DIR/client-xray.json" || die "Installed Xray rejected the generated client profile"
 
 install -m 700 /dev/stdin "$RESULT_DIR/remove.sh" <<EOF
 #!/usr/bin/env bash
@@ -500,6 +561,11 @@ printf 'Bot metadata:     %s\n' "$BOT_EXTERNAL_REMARK"
 printf 'Local inbound:    127.0.0.1:%s\n' "$INBOUND_PORT"
 printf '3x-ui inbound ID: %s\n' "$INBOUND_ID"
 printf 'Client files:     %s\n' "$RESULT_DIR"
+printf 'XHTTP profile:    packet-up, GET/body, 3000000 bytes, buffer 100, XMUX concurrency 1\n'
+printf 'nginx body limit: 4m (XHTTP location only)\n'
+printf 'Origin HTTPS:     TLS 1.2 / TLS 1.3; HSTS max-age=31536000 (HTTPS only)\n'
+printf 'Full Happ JSON:   %s/happ-client.json\n' "$RESULT_DIR"
+printf 'Full Xray JSON:   %s/client-xray.json\n' "$RESULT_DIR"
 printf 'VLESS link:\n'
 cat "$RESULT_DIR/vless-link.txt"
 printf '\nTimeweb CDN settings:\n'
